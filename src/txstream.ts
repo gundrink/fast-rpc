@@ -1,0 +1,102 @@
+// Transaction stream built on shared logsSubscribe topics + getTransaction fetch (Helius transactionSubscribe-like).
+import type { StreamHub, Entry } from "./stream.js";
+import { INVALID_PARAMS } from "./errors.js";
+import { decodeTransaction, isPubkey } from "./codec.js";
+
+export const VOTE_PROGRAM = "Vote111111111111111111111111111111111111111";
+export interface TxFilter { accountInclude?: string[]; accountExclude?: string[]; accountRequired?: string[]; vote?: boolean; failed?: boolean; signature?: string }
+export interface TxOptions { commitment?: "confirmed" | "finalized"; encoding?: "json" | "jsonParsed" | "base64" | "base58"; transactionDetails?: "full" | "signatures" | "accounts" | "none"; showRewards?: boolean; maxSupportedTransactionVersion?: number }
+export type GetTx = (sig: string, cfg: any) => Promise<any>;
+export const MAX_FILTER_ACCOUNTS = Number(process.env.TX_FILTER_MAX_ACCOUNTS ?? 100);
+
+export function validateTxFilter(f: any): TxFilter {
+  if (f == null || typeof f !== "object" || Array.isArray(f)) throw INVALID_PARAMS("transactionSubscribe: params[0] must be a filter object");
+  for (const k of ["accountInclude", "accountExclude", "accountRequired"] as const) {
+    if (f[k] === undefined) continue;
+    if (!Array.isArray(f[k]) || !f[k].every(isPubkey)) throw INVALID_PARAMS(`transactionSubscribe: ${k} must be an array of base58 pubkeys`);
+  }
+  const watch = new Set([...(f.accountInclude ?? []), ...(f.accountRequired ?? [])]);
+  if (!watch.size) throw INVALID_PARAMS("transactionSubscribe: accountInclude or accountRequired must be non-empty (logs-based backend)");
+  if (watch.size > MAX_FILTER_ACCOUNTS) throw INVALID_PARAMS(`transactionSubscribe: max ${MAX_FILTER_ACCOUNTS} accounts`);
+  return f;
+}
+
+/** Collect every account key of a getTransaction result (static + loaded via lookup tables). */
+export function txAccountKeys(r: any): string[] {
+  const keys: string[] = [];
+  const tx = r?.transaction;
+  if (Array.isArray(tx)) { try { keys.push(...decodeTransaction(tx[0], tx[1]).accountKeys); } catch {} }
+  else for (const k of tx?.message?.accountKeys ?? []) keys.push(typeof k === "string" ? k : k.pubkey);
+  const la = r?.meta?.loadedAddresses;
+  if (la) keys.push(...(la.writable ?? []), ...(la.readonly ?? []));
+  return keys;
+}
+
+export function matchesFilter(f: TxFilter, keys: string[], failed: boolean): boolean {
+  if (failed && f.failed === false) return false;
+  if (f.vote !== true && keys.includes(VOTE_PROGRAM)) return false;
+  const set = new Set(keys);
+  if (f.accountRequired?.some((k) => !set.has(k))) return false;
+  if (f.accountExclude?.some((k) => set.has(k))) return false;
+  if (f.accountInclude?.length && !f.accountInclude.some((k) => set.has(k))) return false;
+  return true;
+}
+
+export interface TxEvent { signature: string; slot: number; tx: any }
+
+export class TxWatcher {
+  private detach: (() => void)[] = [];
+  private seen = new Set<string>(); private seenQ: string[] = [];
+  private queue: { sig: string; slot: number }[] = [];
+  private inflight = 0;
+  private stopped = false;
+  stats = { matched: 0, filtered: 0, fetchFailed: 0, dropped: 0 };
+  constructor(private hub: StreamHub, private getTx: GetTx, private filter: TxFilter, private opts: TxOptions, private onTx: (e: TxEvent) => void,
+    private cfg = { concurrency: 8, maxQueue: 2000, retries: 4, retryMs: 400 }) {
+    const watch = new Set([...(filter.accountInclude ?? []), ...(filter.accountRequired ?? [])]);
+    for (const a of watch) {
+      const r = hub.subscribe("logs", { mentions: a, commitment: opts.commitment ?? "confirmed" }, { deliver: (e: Entry) => this.onLog(e) });
+      this.detach.push(r.detach);
+    }
+  }
+  private onLog(e: Entry) {
+    const v = e.data; const sig = v?.signature;
+    if (!sig || this.seen.has(sig)) return;
+    this.seen.add(sig); this.seenQ.push(sig); if (this.seenQ.length > 20_000) this.seen.delete(this.seenQ.shift()!);
+    if (v.err && this.filter.failed === false) { this.stats.filtered++; return; }
+    if (this.filter.vote !== true && (v.logs ?? []).some((l: string) => l.includes(VOTE_PROGRAM))) { this.stats.filtered++; return; }
+    if (this.queue.length >= this.cfg.maxQueue) { this.queue.shift(); this.stats.dropped++; }
+    this.queue.push({ sig, slot: e.slot });
+    this.pump();
+  }
+  private pump() {
+    while (!this.stopped && this.inflight < this.cfg.concurrency && this.queue.length) {
+      const job = this.queue.shift()!; this.inflight++;
+      this.fetch(job.sig).then((r) => {
+        if (this.stopped) return;
+        if (!r) { this.stats.fetchFailed++; return; }
+        if (!matchesFilter(this.filter, txAccountKeys(r), !!r.meta?.err)) { this.stats.filtered++; return; }
+        this.stats.matched++;
+        try { this.onTx({ signature: job.sig, slot: r.slot ?? job.slot, tx: r }); } catch {}
+      }).finally(() => { this.inflight--; this.pump(); });
+    }
+  }
+  private async fetch(sig: string) {
+    const cfg = { encoding: this.opts.encoding ?? "json", commitment: this.opts.commitment ?? "confirmed", maxSupportedTransactionVersion: this.opts.maxSupportedTransactionVersion ?? 0 };
+    for (let i = 0; i <= this.cfg.retries; i++) {
+      try { const r = await this.getTx(sig, cfg); if (r) return r; } catch {}
+      if (this.stopped) return null;
+      await new Promise((res) => setTimeout(res, this.cfg.retryMs * (i + 1)));
+    }
+    return null;
+  }
+  stop() { this.stopped = true; for (const d of this.detach) d(); this.detach = []; this.queue = []; }
+}
+
+/** Helius transactionNotification result shape. */
+export function heliusTxResult(e: TxEvent, details: TxOptions["transactionDetails"] = "full") {
+  const r = e.tx;
+  const inner = details === "signatures" ? { signatures: Array.isArray(r.transaction) ? undefined : r.transaction?.signatures, meta: r.meta }
+    : details === "none" ? { meta: r.meta } : { transaction: r.transaction, meta: r.meta };
+  return { transaction: { ...inner, version: r.version ?? "legacy" }, signature: e.signature, slot: e.slot };
+}

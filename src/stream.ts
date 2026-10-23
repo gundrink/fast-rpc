@@ -1,6 +1,9 @@
 // Subscription manager: one upstream sub per topic, fan-out, dedup, seq numbers, ring buffer replay.
 import { SolanaWs, Upstream } from "./upstream-ws.js";
 import { INVALID_PARAMS } from "./errors.js";
+import fs from "node:fs";
+import path from "node:path";
+import { createHash } from "node:crypto";
 
 export const STREAM_TYPES = ["slot", "root", "account", "program", "logs", "signature"] as const;
 export type StreamType = (typeof STREAM_TYPES)[number];
@@ -40,7 +43,43 @@ const SPEC: Record<StreamType, { validate(raw: any[]): void; slot(r: any): numbe
     slot: (r) => r.context.slot, key: (r) => `g${r.context.slot}:${JSON.stringify(r.value)}`, data: (r) => r.value, once: true },
 };
 
-export interface HubOptions { upstream?: Upstream; wsUrl?: string; ringSize?: number; lingerMs?: number; log?: (...a: any[]) => void }
+export interface HubOptions {
+  upstream?: Upstream; wsUrl?: string; ringSize?: number; lingerMs?: number; log?: (...a: any[]) => void;
+  /** Directory for the append-only disk ring (survives restarts). Default: STREAM_PERSIST_DIR env. */
+  persistDir?: string;
+  /** Drop persisted entries older than this. Default: STREAM_RETENTION_MS env or 1h. */
+  retentionMs?: number;
+}
+
+/** Append-only JSONL log per topic: {seq,slot,ts,k,raw}. Compacted to the ring when it grows past 2x ringSize. */
+class DiskLog {
+  private fd: number; private lines = 0;
+  constructor(readonly file: string) { this.fd = fs.openSync(file, "a"); }
+  static fileFor(dir: string, key: string) { return path.join(dir, createHash("sha1").update(key).digest("hex").slice(0, 24) + ".jsonl"); }
+  static load(file: string, retentionMs: number) {
+    const out: { seq: number; slot: number; ts: number; k: string; raw: any }[] = [];
+    if (!fs.existsSync(file)) return out;
+    const cutoff = Date.now() - retentionMs;
+    for (const line of fs.readFileSync(file, "utf8").split("\n")) {
+      if (!line) continue;
+      try { const r = JSON.parse(line); if (typeof r.seq === "number") out.push(r); } catch {} // tolerate torn last line
+    }
+    // seq must survive even if all entries expired: keep max seq, return only fresh entries
+    const maxSeq = out.reduce((m, r) => Math.max(m, r.seq), 0);
+    return Object.assign(out.filter((r) => r.ts >= cutoff), { maxSeq });
+  }
+  append(rec: object) { fs.writeSync(this.fd, JSON.stringify(rec) + "\n"); this.lines++; }
+  get size() { return this.lines; }
+  rewrite(recs: object[], maxSeq: number) {
+    fs.closeSync(this.fd);
+    const tmp = this.file + ".tmp";
+    // header line preserves seq high-water mark even when ring is empty
+    fs.writeFileSync(tmp, [JSON.stringify({ seq: maxSeq, slot: 0, ts: 0, k: "", raw: null, hdr: 1 }), ...recs.map((r) => JSON.stringify(r))].join("\n") + "\n");
+    fs.renameSync(tmp, this.file);
+    this.fd = fs.openSync(this.file, "a"); this.lines = recs.length + 1;
+  }
+  close() { try { fs.closeSync(this.fd); } catch {} }
+}
 
 class Topic {
   seq = 0;
@@ -49,7 +88,30 @@ class Topic {
   private seen = new Set<string>(); private seenQ: string[] = [];
   private stopUpstream?: () => void;
   private lingerTimer?: NodeJS.Timeout;
-  constructor(readonly key: string, readonly type: StreamType, readonly raw: any[], private hub: StreamHub) {}
+  private disk?: DiskLog;
+  private ts = new WeakMap<Entry, { ts: number; k: string }>();
+  constructor(readonly key: string, readonly type: StreamType, readonly raw: any[], private hub: StreamHub) {
+    if (hub.persistDir && !SPEC[type].once) {
+      const file = DiskLog.fileFor(hub.persistDir, key);
+      try {
+        const recs = DiskLog.load(file, hub.retentionMs) as any;
+        this.seq = recs.maxSeq ?? 0;
+        for (const r of recs) {
+          if (r.hdr) continue;
+          const e: Entry = { seq: r.seq, slot: r.slot, data: SPEC[type].data(r.raw), raw: r.raw };
+          this.ring.push(e); this.ts.set(e, { ts: r.ts, k: r.k });
+          this.seen.add(r.k); this.seenQ.push(r.k);
+        }
+        if (this.ring.length > hub.ringSize) this.ring.splice(0, this.ring.length - hub.ringSize);
+        this.disk = new DiskLog(file);
+        this.compact();
+      } catch (e: any) { hub.log?.("[stream] persist disabled for topic", key, e.message); this.disk = undefined; }
+    }
+  }
+  private compact() {
+    const cutoff = Date.now() - this.hub.retentionMs;
+    this.disk!.rewrite(this.ring.filter((e) => (this.ts.get(e)?.ts ?? Date.now()) >= cutoff).map((e) => ({ seq: e.seq, slot: e.slot, ts: this.ts.get(e)?.ts ?? Date.now(), k: this.ts.get(e)?.k ?? "", raw: e.raw })), this.seq);
+  }
 
   start(up: Upstream) {
     const spec = SPEC[this.type];
@@ -62,6 +124,11 @@ class Topic {
       if (this.seenQ.length > 8192) this.seen.delete(this.seenQ.shift()!);
       e.seq = ++this.seq;
       this.ring.push(e); if (this.ring.length > this.hub.ringSize) this.ring.shift();
+      if (this.disk) {
+        const ts = Date.now(); this.ts.set(e, { ts, k });
+        try { this.disk.append({ seq: e.seq, slot: e.slot, ts, k, raw: r }); if (this.disk.size > 2 * this.hub.ringSize) this.compact(); }
+        catch (err: any) { this.hub.log?.("[stream] persist write failed", err.message); }
+      }
       for (const s of [...this.subs]) { try { s.deliver(e); } catch {} }
       if (spec.once) { for (const s of [...this.subs]) s.onEnd?.(); this.subs.clear(); this.teardown(); }
     });
@@ -74,7 +141,7 @@ class Topic {
     this.lingerTimer = setTimeout(() => { if (!this.subs.size) this.teardown(); }, this.hub.lingerMs);
     this.lingerTimer.unref();
   }
-  teardown() { clearTimeout(this.lingerTimer); this.stopUpstream?.(); this.stopUpstream = undefined; this.hub.drop(this.key, this); }
+  teardown() { clearTimeout(this.lingerTimer); this.disk?.close(); this.disk = undefined; this.stopUpstream?.(); this.stopUpstream = undefined; this.hub.drop(this.key, this); }
   replay(fromSeq?: number, fromSlot?: number): { entries: Entry[]; lost: number } {
     if (fromSeq != null) {
       const entries = this.ring.filter((e) => e.seq > fromSeq);
@@ -91,7 +158,14 @@ export class StreamHub {
   readonly upstream: Upstream;
   readonly ringSize: number;
   readonly lingerMs: number;
+  readonly persistDir?: string;
+  readonly retentionMs: number;
+  readonly log?: (...a: any[]) => void;
   constructor(opts: HubOptions = {}) {
+    this.persistDir = opts.persistDir ?? process.env.STREAM_PERSIST_DIR;
+    this.retentionMs = opts.retentionMs ?? Number(process.env.STREAM_RETENTION_MS ?? 3_600_000);
+    this.log = opts.log;
+    if (this.persistDir) fs.mkdirSync(this.persistDir, { recursive: true });
     this.upstream = opts.upstream ?? new SolanaWs(opts.wsUrl, opts.log);
     this.ringSize = opts.ringSize ?? Number(process.env.STREAM_RING ?? 2000);
     this.lingerMs = opts.lingerMs ?? 10_000;

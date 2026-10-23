@@ -9,7 +9,7 @@ type Sub = {
   lastSeq: number; resuming: boolean; fromSlot?: number;
 };
 export interface ClientOptions {
-  reconnect?: boolean; pingMs?: number; minBackoffMs?: number; maxBackoffMs?: number; requestTimeoutMs?: number;
+  reconnect?: boolean; pingMs?: number; /** sent in an Auth frame on every (re)connect */ apiKey?: string; minBackoffMs?: number; maxBackoffMs?: number; requestTimeoutMs?: number;
   log?: (...a: any[]) => void;
 }
 
@@ -25,7 +25,7 @@ export class RpcClient {
   private retryTimer?: NodeJS.Timeout;
   private lastPong = Date.now();
   private backoff: number;
-  private o: Required<Omit<ClientOptions, "log">> & { log: (...a: any[]) => void };
+  private o: Required<Omit<ClientOptions, "log" | "apiKey">> & { apiKey?: string; log: (...a: any[]) => void };
   reconnects = 0;
 
   private constructor(private port: number, private host: string, opts: ClientOptions) {
@@ -53,10 +53,19 @@ export class RpcClient {
         if (this.closed) { sock.destroy(); return rej(new Error("client closed")); }
         this.sock = sock; this.backoff = this.o.minBackoffMs; this.lastPong = Date.now();
         this.startPing();
-        // Resume every stream from its last seen seq (server replays the gap from its ring buffer).
-        for (const [id, s] of this.subs) this.sendSubscribe(id, s).catch((e) => this.o.log(`[client] resubscribe ${s.type} failed: ${e.message}`));
+        const ready = () => {
+          // Resume every stream from its last seen seq (server replays the gap from its ring buffer).
+          for (const [id, s] of this.subs) this.sendSubscribe(id, s).catch((e) => this.o.log(`[client] resubscribe ${s.type} failed: ${e.message}`));
+          this.flush();
+          res();
+        };
+        if (this.o.apiKey == null) return ready();
+        this.request(MsgType.Auth, this.id(), { apiKey: this.o.apiKey }).then(ready, (e) => {
+          this.o.log(`[client] auth failed: ${e.message}`);
+          this.closed = true; sock.destroy(); // bad key: don't hammer the server with reconnects
+          rej(e);
+        });
         this.flush();
-        res();
       });
       const dec = new FrameDecoder((type, id, payload) => this.onFrame(type, id, payload), {
         onError: (e) => { this.o.log("[client] bad frame:", e.message); sock.destroy(); },

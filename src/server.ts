@@ -4,10 +4,13 @@ import { WebSocketServer, WebSocket } from "ws";
 import { encode, FrameDecoder, MsgType } from "./protocol.js";
 import { RpcError } from "./errors.js";
 import { STREAM_TYPES, type StreamHub, type StreamType, type Entry } from "./stream.js";
+import { Limiter } from "./limits.js";
+import { TxWatcher, validateTxFilter, heliusTxResult, type GetTx } from "./txstream.js";
+import { WebhookError, type WebhookManager } from "./webhooks.js";
 
 type Handler = (...args: any[]) => any | Promise<any>;
 const HTTP_PREFIXES = ["GET ", "POST", "PUT ", "HEAD", "OPTI", "DELE", "PATC"];
-const SUB_RE = new RegExp(`^(${STREAM_TYPES.join("|")})(Subscribe|Unsubscribe)$`);
+const SUB_RE = new RegExp(`^(${[...STREAM_TYPES, "transaction"].join("|")})(Subscribe|Unsubscribe)$`);
 
 export interface ServerOptions {
   /** bytes buffered per consumer above which stream notifications are dropped (client resumes via seq gap) */
@@ -21,6 +24,8 @@ export interface ServerOptions {
   /** Helius-style `?api-key=` check for HTTP/WS/SSE; empty = open */
   apiKeys?: string[];
   wsPingMs?: number;
+  /** per-key rate limits / credits (default: Limiter.fromEnv(): KEY_LIMITS, DEFAULT_RPS, DEFAULT_CREDITS) */
+  limiter?: Limiter;
   log?: (...a: any[]) => void;
 }
 
@@ -62,6 +67,7 @@ export class RpcServer {
       maxBodyBytes: opts.maxBodyBytes ?? 5 << 20,
       apiKeys: opts.apiKeys ?? (process.env.API_KEYS ? process.env.API_KEYS.split(",").map((s) => s.trim()).filter(Boolean) : []),
       wsPingMs: opts.wsPingMs ?? 30_000,
+      limiter: opts.limiter ?? Limiter.fromEnv(),
       log: opts.log ?? (() => {}),
     };
     this.http = http.createServer({ maxHeaderSize: 16 << 10 }, (req, res) => this.onHttp(req, res).catch((e) => {
@@ -73,14 +79,19 @@ export class RpcServer {
     this.wss = new WebSocketServer({ noServer: true, maxPayload: 1 << 20 });
     this.http.on("upgrade", (req, sock, head) => {
       if (!this.authorized(req.url)) { sock.end("HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n"); return; }
-      this.wss.handleUpgrade(req, sock as net.Socket, head, (ws) => this.onWs(ws));
+      this.wss.handleUpgrade(req, sock as net.Socket, head, (ws) => this.onWs(ws, this.keyOf(req.url)));
     });
     this.http.on("clientError", (_e, sock) => { if (sock.writable) sock.end("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"); else sock.destroy(); });
   }
 
   register(name: string, fn: Handler) { this.handlers.set(name, fn); return this; }
   registerAll(api: Record<string, Handler>) { for (const [k, fn] of Object.entries(api)) this.register(k, fn); return this; }
-  attachStreams(hub: StreamHub) { this.hub = hub; return this; }
+  /** getTx enables transactionSubscribe (logs topics + getTransaction). */
+  attachStreams(hub: StreamHub, getTx?: GetTx) { this.hub = hub; this.getTx = getTx; return this; }
+  attachWebhooks(m: WebhookManager) { this.webhooks = m; return this; }
+  get limiter() { return this.o.limiter; }
+  private getTx?: GetTx;
+  private webhooks?: WebhookManager;
   listen(port: number, host = "127.0.0.1"): Promise<number> {
     return new Promise((r, j) => { this.tcp.once("error", j); this.tcp.listen(port, host, () => r((this.tcp.address() as net.AddressInfo).port)); });
   }
@@ -96,9 +107,12 @@ export class RpcServer {
     return !!k && this.o.apiKeys.includes(k);
   }
 
-  private async dispatch(method: string, params: any) {
+  private keyOf(url = "/") { return new URL(url, "http://x").searchParams.get("api-key") || "anonymous"; }
+
+  private async dispatch(method: string, params: any, key = "anonymous") {
     const fn = this.handlers.get(method);
     if (!fn) throw new RpcError(-32601, "Method not found");
+    this.o.limiter.take(key, method);
     const args = params === undefined || params === null ? [] : Array.isArray(params) ? params : [params];
     return fn(...args);
   }
@@ -132,12 +146,23 @@ export class RpcServer {
     const bp = gate(this.o, this.stats);
     const send = (b: Buffer) => { if (!sock.destroyed && sock.writable) sock.write(b); };
     const errMsg = (e: any) => String(e?.message ?? e);
+    let key: string | undefined = this.o.apiKeys.length ? undefined : "anonymous";
     const dec = new FrameDecoder((type, id, payload) => {
+      if (type === MsgType.Auth) {
+        const k = payload?.apiKey;
+        if (typeof k === "string" && (!this.o.apiKeys.length || this.o.apiKeys.includes(k))) { key = k; send(encode(MsgType.Response, id, { ok: true })); }
+        else { send(encode(MsgType.Error, id, "Unauthorized: invalid api key")); sock.end(); }
+        return;
+      }
+      if (key === undefined) {
+        if (type === MsgType.Ping) { send(encode(MsgType.Pong, id, null)); return; }
+        send(encode(MsgType.Error, id, "Unauthorized: send Auth frame {apiKey} first")); sock.end(); return;
+      }
       switch (type) {
         case MsgType.Request: {
           if (!Array.isArray(payload) || typeof payload[0] !== "string") { send(encode(MsgType.Error, id, "invalid request: expected [method, args[]]")); return; }
           const [method, args] = payload;
-          Promise.resolve().then(() => this.dispatch(method, Array.isArray(args) ? args : []))
+          Promise.resolve().then(() => this.dispatch(method, Array.isArray(args) ? args : [], key))
             .then((r) => send(encode(MsgType.Response, id, r ?? null)), (e) => send(encode(MsgType.Error, id, errMsg(e))));
           return;
         }
@@ -148,6 +173,7 @@ export class RpcServer {
           if (!payload || typeof payload !== "object") { send(encode(MsgType.Error, id, "invalid subscribe payload")); return; }
           subs.get(id)?.(); subs.delete(id); // re-subscribe (resume) replaces previous registration
           try {
+            this.o.limiter.take(key, "subscribe");
             const sub = {
               deliver: (e: Entry) => {
                 if (sock.destroyed) return;
@@ -179,7 +205,7 @@ export class RpcServer {
   }
 
   // ---------- JSON-RPC 2.0 core (HTTP + WS) ----------
-  private async rpcOne(r: any): Promise<JsonRpcReply | undefined> {
+  private async rpcOne(r: any, key = "anonymous"): Promise<JsonRpcReply | undefined> {
     const isObj = r !== null && typeof r === "object" && !Array.isArray(r);
     const idOk = isObj && (typeof r.id === "string" || typeof r.id === "number" || r.id === null);
     const id = idOk ? r.id : null;
@@ -188,7 +214,7 @@ export class RpcServer {
       return rpcErr(id, -32600, "Invalid request");
     const notification = !("id" in r);
     try {
-      const result = await this.dispatch(r.method, r.params);
+      const result = await this.dispatch(r.method, r.params, key);
       return notification ? undefined : { jsonrpc: "2.0", id, result: result === undefined ? null : result };
     } catch (e: any) {
       if (notification) return undefined;
@@ -213,22 +239,56 @@ export class RpcServer {
     const url = new URL(req.url ?? "/", "http://x");
     res.setHeader("Access-Control-Allow-Origin", "*");
     if (req.method === "OPTIONS") {
-      res.writeHead(204, { "Access-Control-Allow-Methods": "GET, POST, OPTIONS", "Access-Control-Allow-Headers": "content-type, solana-client" });
+      res.writeHead(204, { "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS", "Access-Control-Allow-Headers": "content-type, solana-client" });
       return void res.end();
     }
     if (req.method === "GET" && url.pathname === "/health") { res.writeHead(200, { "content-type": "text/plain" }); return void res.end("ok"); }
     if (!this.authorized(req.url)) return this.json(res, 401, rpcErr(null, -32401, "Unauthorized: invalid or missing api-key"));
-    if (req.method === "GET" && url.pathname === "/stream") return this.sse(req, res, url);
+    const key = this.keyOf(req.url);
+    if (req.method === "GET" && url.pathname === "/stream") {
+      try { this.o.limiter.take(key, "subscribe"); } catch (e: any) { return this.json(res, 429, rpcErr(null, e.code, e.message)); }
+      return this.sse(req, res, url);
+    }
+    if (req.method === "GET" && url.pathname === "/v0/usage") return this.json(res, 200, this.o.limiter.report(key));
+    if (url.pathname === "/v0/webhooks" || url.pathname.startsWith("/v0/webhooks/")) return this.rest(req, res, url, key);
     if (req.method !== "POST") return this.json(res, 405, rpcErr(null, -32600, "Use POST for JSON-RPC"));
+    const body = await this.readBody(req, res); if (body === undefined) return;
+    const out = await this.handleJsonRpc(body, (r) => this.rpcOne(r, key));
+    if (out === undefined) { res.writeHead(204); return void res.end(); }
+    const limited = Array.isArray(out) ? out.length > 0 && out.every((o: any) => o?.error?.code === -32429) : out.error?.code === -32429;
+    return this.json(res, limited ? 429 : 200, out);
+  }
+
+  private async readBody(req: http.IncomingMessage, res: http.ServerResponse) {
     const chunks: Buffer[] = []; let size = 0;
     for await (const c of req) {
       size += c.length;
-      if (size > this.o.maxBodyBytes) { res.setHeader("connection", "close"); return this.json(res, 413, rpcErr(null, -32600, "Request too large")); }
+      if (size > this.o.maxBodyBytes) { res.setHeader("connection", "close"); this.json(res, 413, rpcErr(null, -32600, "Request too large")); return undefined; }
       chunks.push(c);
     }
-    const out = await this.handleJsonRpc(Buffer.concat(chunks).toString("utf8"));
-    if (out === undefined) { res.writeHead(204); return void res.end(); }
-    return this.json(res, 200, out);
+    return Buffer.concat(chunks).toString("utf8");
+  }
+
+  /** Helius-like webhook REST: POST/GET /v0/webhooks, GET/PUT/DELETE /v0/webhooks/:id (scoped to the api key). */
+  private async rest(req: http.IncomingMessage, res: http.ServerResponse, url: URL, key: string) {
+    if (!this.webhooks) return this.json(res, 404, { error: "webhooks not enabled" });
+    const id = url.pathname.split("/")[3];
+    try {
+      this.o.limiter.take(key, "webhook");
+      const body = req.method === "POST" || req.method === "PUT" ? await this.readBody(req, res) : "";
+      if (body === undefined) return;
+      const parse = () => { try { return JSON.parse(body); } catch { throw new WebhookError(400, "invalid JSON body"); } };
+      if (!id && req.method === "POST") return this.json(res, 200, this.webhooks.create(key, parse()));
+      if (!id && req.method === "GET") return this.json(res, 200, this.webhooks.list(key));
+      if (id && req.method === "GET") return this.json(res, 200, this.webhooks.get(key, id));
+      if (id && req.method === "PUT") return this.json(res, 200, this.webhooks.update(key, id, parse()));
+      if (id && req.method === "DELETE") { this.webhooks.delete(key, id); res.writeHead(200); return void res.end(); }
+      return this.json(res, 405, { error: "method not allowed" });
+    } catch (e: any) {
+      if (e instanceof WebhookError) return this.json(res, e.status, { error: e.message });
+      if (e instanceof RpcError && e.code === -32429) return this.json(res, 429, { error: e.message });
+      throw e;
+    }
   }
 
   private json(res: http.ServerResponse, status: number, body: any) {
@@ -266,8 +326,8 @@ export class RpcServer {
   }
 
   // ---------- Solana-compatible JSON-RPC WebSocket (Helius/Solana pubsub) ----------
-  private onWs(ws: WebSocket) {
-    const subs = new Map<number, { type: StreamType; detach: () => void }>();
+  private onWs(ws: WebSocket, key = "anonymous") {
+    const subs = new Map<number, { type: StreamType | "transaction"; detach: () => void }>();
     let alive = true;
     const bp = gate(this.o, this.stats);
     const ping = setInterval(() => { if (!alive) { ws.terminate(); return; } alive = false; ws.ping(); }, this.o.wsPingMs);
@@ -276,8 +336,31 @@ export class RpcServer {
 
     const one = async (r: any): Promise<JsonRpcReply | undefined> => {
       const m = typeof r?.method === "string" ? SUB_RE.exec(r.method) : null;
-      if (!m || r.jsonrpc !== "2.0") return this.rpcOne(r);
+      if (!m || r.jsonrpc !== "2.0") return this.rpcOne(r, key);
       const id = typeof r.id === "string" || typeof r.id === "number" ? r.id : null;
+      if (m[2] === "Subscribe") { try { this.o.limiter.take(key, "subscribe"); } catch (e: any) { return rpcErr(id, e.code, e.message); } }
+      if (m[1] === "transaction") {
+        if (m[2] === "Unsubscribe") {
+          const sid = Array.isArray(r.params) ? r.params[0] : undefined; const s = subs.get(sid);
+          if (!s || s.type !== "transaction") return rpcErr(id, -32602, "Invalid subscription id.");
+          s.detach(); subs.delete(sid); return { jsonrpc: "2.0", id, result: true };
+        }
+        if (!this.hub || !this.getTx) return rpcErr(id, -32601, "Method not found");
+        try {
+          const p = Array.isArray(r.params) ? r.params : [];
+          const filter = validateTxFilter(p[0]); const o = p[1] ?? {};
+          if (typeof o !== "object") throw new RpcError(-32602, "transactionSubscribe: options must be an object");
+          const sid = this.nextWsSub++;
+          const w = new TxWatcher(this.hub, this.getTx, filter, o, (e) => {
+            const g = bp(ws.bufferedAmount);
+            if (g === "kill") { ws.terminate(); return; }
+            if (g === "drop") return;
+            send({ jsonrpc: "2.0", method: "transactionNotification", params: { subscription: sid, result: heliusTxResult(e, o.transactionDetails) } });
+          });
+          subs.set(sid, { type: "transaction", detach: () => w.stop() });
+          return { jsonrpc: "2.0", id, result: sid };
+        } catch (e: any) { return e instanceof RpcError ? rpcErr(id, e.code, e.message) : rpcErr(id, -32603, String(e?.message ?? e)); }
+      }
       const type = m[1] as StreamType;
       if (m[2] === "Unsubscribe") {
         const sid = Array.isArray(r.params) ? r.params[0] : undefined;

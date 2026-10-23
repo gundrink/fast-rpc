@@ -27,7 +27,9 @@ export async function startMockSolana() {
     req.on("end", () => {
       const r = JSON.parse(b); calls.push({ method: r.method, params: r.params });
       const f = responses[r.method];
-      const out = f ? { jsonrpc: "2.0", id: r.id, result: f(r.params) } : { jsonrpc: "2.0", id: r.id, error: { code: -32601, message: "Method not found" } };
+      let out: any;
+      try { out = f ? { jsonrpc: "2.0", id: r.id, result: f(r.params) } : { jsonrpc: "2.0", id: r.id, error: { code: -32601, message: "Method not found" } }; }
+      catch (e: any) { out = { jsonrpc: "2.0", id: r.id, error: { code: -32002, message: String(e?.message ?? e) } }; }
       res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(out));
     });
   });

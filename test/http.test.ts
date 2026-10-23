@@ -42,7 +42,7 @@ test("-32600 invalid request variants", async () => {
 });
 
 test("-32601 method not found (id echoed)", async () => {
-  const r = await rpc({ jsonrpc: "2.0", id: 9, method: "sendTransaction", params: ["x"] });
+  const r = await rpc({ jsonrpc: "2.0", id: 9, method: "requestAirdrop", params: ["x", 1] });
   assert.deepEqual(r.json, { jsonrpc: "2.0", id: 9, error: { code: -32601, message: "Method not found" } });
 });
 

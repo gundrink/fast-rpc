@@ -9,7 +9,7 @@ Fast TypeScript RPC gateway for Solana, inspired by Helius RPC / LaserStream. A 
 | Solana pubsub WebSocket (`ws://host:port/?api-key=…`) | HTTP `Upgrade: websocket` | `accountSubscribe`, `slotSubscribe`, `logsSubscribe`, … (Solana/Helius-identical shapes) |
 | SSE `GET /stream?type=…` | HTTP GET | `curl -N` streaming |
 
-All upstream access is **read-only** (whitelisted methods; `sendTransaction` etc. → `-32601`).
+Upstream access is **read-only** (whitelisted methods) except the **send relay**: `sendTransaction` / `simulateTransaction` forward *user-signed* transactions. fast-rpc never holds keys.
 
 ## Architecture
 
@@ -37,13 +37,43 @@ All upstream access is **read-only** (whitelisted methods; `sendTransaction` etc
 4. **Encode**: binary returns a `Response`/`Error` frame with the same id (out of order, multiplexed). HTTP returns a JSON body.
 
 ### Streaming (LaserStream-style)
-- **Frames**: `Subscribe=3 {type, params, fromSeq?, fromSlot?}` → ack `{ok, topic, headSeq, replayed, lost, firstSeq}`; `Notification=4 {seq, slot, data}`; `Unsubscribe=5`; `Ping=6`/`Pong=7`.
+- **Frames**: `Subscribe=3 {type, params, fromSeq?, fromSlot?}` → ack `{ok, topic, headSeq, replayed, lost, firstSeq}`; `Notification=4 {seq, slot, data}`; `Unsubscribe=5`; `Ping=6`/`Pong=7`; `Auth=8 {apiKey}`.
 - **Fan-out + dedup**: one upstream subscription per topic (type plus raw params), shared by every binary, WS and SSE consumer. Messages are deduped by slot, signature, or pubkey@slot, so an upstream reconnect never double-delivers. Idle topics linger 10s to keep the ring warm for clients that reconnect.
 - **Seq + ring buffer**: each topic has a monotonically increasing `seq` and keeps the last `STREAM_RING` (2000) entries. `fromSeq` / `fromSlot` replay from that ring.
 - **At-least-once + resume**: the server sends **ack → replay → live** in one tick, so they are strictly ordered. The client tracks `lastSeq`. After a reconnect (exponential backoff with jitter) it re-subscribes with `fromSeq`, drops duplicates, and treats a seq gap as a trigger to resume. If the gap has already fallen out of the ring, the ack reports `lost` and `onGap(lost)` fires.
 - **Keepalive**: the client pings every 5s and reconnects after 3 missed intervals. The server pings WS clients every 30s. The upstream WS is pinged every 20s and terminated if a pong is missed.
 - **Backpressure** (binary, WS, SSE alike): above `STREAM_SOFT_LIMIT` (1MB) buffered, notifications are dropped (the client resumes from the ring). A consumer that stays above the soft limit for `STREAM_SLOW_TIMEOUT_MS` (10s), or goes above `STREAM_HARD_LIMIT` (8MB), is disconnected.
 - **Stream types**: `slot`, `root`, `account`, `program`, `logs`, `signature`. `signature` is one-shot, as in Solana.
+- **Persistent replay (optional)**: set `STREAM_PERSIST_DIR` and each topic appends `{seq,slot,ts,k,raw}` JSON lines to `<dir>/<sha1(topic)>.jsonl`. When a topic is created (also after a process restart), the file is loaded: the ring, the dedup set and the **seq high-water mark** are restored, so `fromSeq` resume works across restarts. Entries older than `STREAM_RETENTION_MS` (default 1h) are dropped. The file is compacted to the ring once it grows past 2×`STREAM_RING` lines, and a torn last line is tolerated. Signature topics are not persisted.
+
+### Send relay (Sender-like)
+`sendTransaction` / `simulateTransaction` accept the standard Solana params (`[tx, {encoding, skipPreflight, preflightCommitment, maxRetries, minContextSlot, sigVerify, replaceRecentBlockhash}]`). The tx is **decoded locally first** (legacy + v0, base58/base64, ≤1232 bytes, ≥1 signer). Malformed input gets `-32602` and never reaches upstream. `sendTransaction` is fanned out in parallel to `SOLANA_RPC_URL` + every URL in `SEND_RPC_URLS` (comma list), and the first success (the signature) wins. If every upstream fails, the first upstream error is returned. `simulateTransaction` goes only to the primary.
+
+### DAS API
+- With `DAS_RPC_URL` set (e.g. a Helius URL), all DAS methods (`getAsset getAssetBatch getAssetsByOwner getAssetsByGroup getAssetsByCreator getAssetsByAuthority searchAssets getAssetProof getAssetProofBatch getSignaturesForAsset getTokenAccounts getNftEditions`) are proxied as-is (object params).
+- Without it, there is a **best-effort on-chain fallback** for `getAsset`, `getAssetBatch` and `getAssetsByOwner`. It reads the SPL mint (`jsonParsed`) plus the Metaplex Token Metadata PDA (borsh-decoded: name, symbol, uri, royalties, creators, token standard, verified collection) and returns the Helius asset shape. `getAssetsByOwner` scans Token + Token-2022 accounts (zero balances hidden unless `displayOptions.showZeroBalance`) with `page`/`limit`.
+  - The fallback has **no** off-chain JSON (`content.files/links` are empty), no compressed NFTs, no editions/print supply, no `burnt` detection and no price info.
+  - Other DAS methods return `-32601 "… requires DAS_RPC_URL"`.
+
+### transactionSubscribe (Helius Enhanced WS shape)
+`{"method":"transactionSubscribe","params":[{"accountInclude":[…],"accountExclude":[…],"accountRequired":[…],"vote":false,"failed":false},{"commitment":"confirmed","encoding":"json|jsonParsed|base64","transactionDetails":"full|signatures|none","maxSupportedTransactionVersion":0}]}`
+→ `transactionNotification {subscription, result:{transaction:{transaction, meta, version}, signature, slot}}`, plus `transactionUnsubscribe`.
+- Implementation: one shared `logsSubscribe{mentions}` topic per account in `accountInclude ∪ accountRequired`. Each new signature (deduped) is fetched with `getTransaction` (bounded concurrency, retries) and then filtered on the full key set, including lookup-table `loadedAddresses`.
+- At least one include/required account is needed (max `TX_FILTER_MAX_ACCOUNTS`, default 100).
+
+### Webhooks (raw)
+REST, scoped to the api key: `POST /v0/webhooks`, `GET /v0/webhooks`, `GET|PUT|DELETE /v0/webhooks/:id`. The body uses the Helius shape `{webhookURL, accountAddresses, transactionTypes:["ANY"], webhookType:"raw", authHeader?, txnStatus?}`.
+- Registrations persist to `WEBHOOKS_FILE` (atomic rewrite) and are re-armed at start-up.
+- Matching transactions (via the transactionSubscribe engine) are POSTed as a JSON **array** of raw `getTransaction` results, with `Authorization: <authHeader>`.
+- Failures (network or 5xx/408/429) are retried with exponential backoff (1s·2ⁿ, 5 retries). Other 4xx responses are permanent failures.
+
+### Auth, rate limits, credits
+- **Binary port**: when `API_KEYS` is set, the first frame must be `Auth=8 {apiKey}`. Anything else (except Ping) gets an Error frame and the connection is closed. `RpcClient.connect(port, host, {apiKey})` re-authenticates on every reconnect, and a rejected key stops reconnecting.
+- **Per-key limits** (all transports): token bucket `rps`/`burst` and a `credits` budget per key.
+  - Configure with `KEY_LIMITS='{"KEY":{"rps":50,"credits":1000000}}'`, plus `DEFAULT_RPS` / `DEFAULT_CREDITS` for other keys.
+  - Costs: 1 per call, 10 for gPA/DAS, 5 for getBlock, 2 for getTransaction/simulate, 1 per subscription.
+  - When over the limit, JSON-RPC returns `-32429` (HTTP `429` if every reply in the batch was limited) and the binary port returns an Error frame.
+  - `GET /v0/usage?api-key=…` → `{requests, creditsUsed, creditsRemaining, rateLimited, rps}`. Counters are in memory.
 
 Client API:
 ```ts
@@ -64,35 +94,46 @@ await unsub();
 | HTTP JSON-RPC 2.0 (single, batch, id echo, error codes) | ✅ |
 | `GET /health` | ✅ |
 | Read methods | ✅ `getHealth getVersion getSlot getBlockHeight getEpochInfo getLatestBlockhash getBalance getAccountInfo getMultipleAccounts(≤100) getTransaction getSignaturesForAddress(limit≤1000) getSignatureStatuses(≤256) getBlock getBlockTime getProgramAccounts(result cap GPA_MAX_RESULTS) getTokenAccountsByOwner getTokenAccountBalance getTokenSupply getMinimumBalanceForRentExemption getRecentPrioritizationFees` |
-| `getPriorityFeeEstimate` | ⚠️ Same request/response shape (`priorityLevel`, `includeAllPriorityFeeLevels`, `priorityFeeLevels{min,low,medium,high,veryHigh,unsafeMax}`). Values are **approximated** from percentiles of `getRecentPrioritizationFees` for the given `accountKeys`. |
+| `getPriorityFeeEstimate` | ⚠️ Same request/response shape (`priorityLevel`, `includeAllPriorityFeeLevels`, `priorityFeeLevels{min,low,medium,high,veryHigh,unsafeMax}`). Accepts `accountKeys` **or a serialized `transaction`** (base58 default, `options.transactionEncoding:"Base64"`), whose static keys are decoded locally. Values are **approximated** from percentiles of `getRecentPrioritizationFees`. |
+| `sendTransaction` / `simulateTransaction` | ✅ relay + optional multi-upstream fan-out (no staked connections / Jito tips) |
+| DAS | ✅ proxied with `DAS_RPC_URL`; ⚠️ partial on-chain fallback otherwise |
+| `transactionSubscribe` | ⚠️ same filters and notification shape; logs+getTransaction backend (see below) |
+| Webhooks | ⚠️ `raw` type only, same REST/body shape |
+| Per-key rate limits / credits, `401`/`429` | ✅ (in-memory) |
 | Standard WS pubsub: `account/program/logs/signature/slot/root` `Subscribe`/`Unsubscribe` | ✅ Notification JSON is the exact upstream result (`{jsonrpc, method:"xNotification", params:{result, subscription}}`). An unknown subscription id → `-32602 "Invalid subscription id."`. |
 | Notification shapes | ✅ Checked live against mainnet (`npm run live`): proxy and direct-mainnet responses have identical key/type shapes. |
 
 ### Honest differences vs Helius
-- **No sending.** `sendTransaction`, `simulateTransaction` and `requestAirdrop` are not proxied. Helius staked connections / Sender are not replicated.
-- **No DAS API** (`getAsset`, `searchAssets`, …), no Enhanced Transactions API, no webhooks, and no `getTransactionsForAddress`-style indexed history. Only what the upstream Solana node can answer is available.
-- **Not Geyser.** Helius LaserStream reads Geyser/gRPC (Yellowstone) directly from validators. This project relays standard Solana WebSocket pubsub, so latency and completeness are bounded by the upstream node. There are no `transactionSubscribe` / Enhanced WebSocket filters (`accountInclude`/`accountRequired`); use `logsSubscribe` with `mentions` instead. Upstream `logsSubscribe` accepts only one `mentions` key.
-- **Replay is in memory**: the ring is per process and lost on restart. Helius replays about 24h (≈216k slots).
-- **Priority fee** is a heuristic (see above). A serialized `transaction` param is ignored; pass `accountKeys`.
-- **gPA limits**: results above `GPA_MAX_RESULTS` return `-32005`. There is no Helius-style `getProgramAccountsV2` pagination. The public mainnet RPC also blocks gPA for large programs (`403`, passed through).
-- **Rate limits / auth**: the API-key check is a simple allow-list. There are no per-key credits or rate limits. The binary protocol port has no key check, so bind it to localhost or a private network.
+- **Sending**: a plain relay to ordinary RPC upstreams with parallel fan-out. There are no staked connections / SWQoS, no Jito bundle or tip routing, and no server-side rebroadcast beyond the upstream `maxRetries`. Live checks only ever use `simulateTransaction`; tests use mocks only.
+- **DAS without `DAS_RPC_URL`** is a partial fallback: SPL mints and Metaplex metadata only. There is no off-chain JSON, no compressed NFTs or proofs, no search or group indexing, and no price data. `requestAirdrop` is not proxied.
+- **Not Geyser.** Helius LaserStream reads Geyser/gRPC (Yellowstone) directly from validators. This project relays standard Solana WebSocket pubsub, so latency and completeness are bounded by the upstream node.
+- **`transactionSubscribe`** costs one extra `getTransaction` per matching signature, so it adds latency (one RPC round trip, plus retries while the tx is not yet visible at `confirmed`).
+  - It cannot watch "all transactions": an include/required account is needed, and it is limited to 100 accounts rather than Helius's 50k.
+  - It only sees transactions whose logs mention the account. Upstream `logsSubscribe{mentions}` matches signers/writable/program keys, so a read-only account referenced only via a lookup table may be missed.
+  - `vote` filtering is heuristic (Vote program in logs/keys).
+- **Webhooks**: only `raw`, with no enhanced parsing (`transactionTypes` is stored but not used to filter). Delivery is one POST per transaction (no batching), there is no delivery dashboard (stats live in memory), and webhooks are lost if the process is down at the time of the transaction (no backfill).
+- **Replay** is in memory by default. With `STREAM_PERSIST_DIR` it survives restarts within `STREAM_RETENTION_MS` and the ring size, but only for topics that were active. Helius replays about 24h (≈216k slots) for any filter.
+- **Priority fee** is a heuristic. For v0 transactions only static keys are decoded (lookup-table keys aren't resolved).
+- **gPA limits**: results above `GPA_MAX_RESULTS` return `-32005`. There is no `getProgramAccountsV2` pagination. The public mainnet RPC also blocks gPA for large programs (`403`, passed through).
+- **Limits/credits** are per process and in memory. Nothing is shared across instances and nothing is billed.
 - **Commitment**: binary streams default to `confirmed`. WS clients pass their own config through unchanged.
 
 ## Run
 ```
 npm install
-npm test               # 43 offline tests (mock Solana HTTP+WS), ~9s
+npm test               # 59 offline tests (mock Solana HTTP+WS, mock send/DAS, local webhook receiver), ~10s
 npm run typecheck
 npm run serve          # :7070 → binary + HTTP JSON-RPC + WS pubsub + SSE
 npm run demo           # binary client RPC calls against mainnet
 npm run stream         # streaming demo: slot, account, fan-out, reconnect+replay, fromSlot
 npm run live           # live shape check vs mainnet + 3s logsSubscribe (few calls)
+npm run live:sim       # simulateTransaction (sigVerify:false), priority fee from tx, getAsset fallback; never sends
 
 curl -X POST 'localhost:7070/?api-key=KEY' -d '{"jsonrpc":"2.0","id":1,"method":"getSlot"}'
 curl -N 'localhost:7070/stream?type=slot'
 wscat -c 'ws://localhost:7070/?api-key=KEY' -x '{"jsonrpc":"2.0","id":1,"method":"slotSubscribe"}'
 ```
-Env: `SOLANA_RPC_URL`, `SOLANA_WS_URL` (defaults mainnet-beta public), `SOLANA_TIMEOUT_MS` (10000), `API_KEYS`, `PORT` (7070), `HOST` (127.0.0.1), `STREAM_RING` (2000), `STREAM_SOFT_LIMIT`, `STREAM_HARD_LIMIT`, `STREAM_SLOW_TIMEOUT_MS`, `MAX_FRAME_BYTES`, `GPA_MAX_RESULTS` (10000).
+Env: `SOLANA_RPC_URL`, `SOLANA_WS_URL` (defaults mainnet-beta public), `SOLANA_TIMEOUT_MS` (10000), `API_KEYS`, `PORT` (7070), `HOST` (127.0.0.1), `STREAM_RING` (2000), `STREAM_SOFT_LIMIT`, `STREAM_HARD_LIMIT`, `STREAM_SLOW_TIMEOUT_MS`, `MAX_FRAME_BYTES`, `GPA_MAX_RESULTS` (10000), `SEND_RPC_URLS`, `DAS_RPC_URL`, `WEBHOOKS_FILE`, `STREAM_PERSIST_DIR`, `STREAM_RETENTION_MS` (3600000), `KEY_LIMITS`, `DEFAULT_RPS`, `DEFAULT_CREDITS`, `TX_FILTER_MAX_ACCOUNTS` (100).
 The public mainnet endpoint is rate-limited; point `SOLANA_RPC_URL`/`SOLANA_WS_URL` at your own node or a provider for real load.
 
 ## Layout
@@ -102,7 +143,12 @@ src/server.ts       RpcServer: sniffing, binary, HTTP JSON-RPC, WS pubsub, SSE, 
 src/client.ts       RpcClient: multiplexing, proxy, subscribe/stream, reconnect+resume, keepalive
 src/stream.ts       StreamHub: topics, dedup, seq, ring replay, linger
 src/upstream-ws.ts  SolanaWs: shared upstream socket, resubscribe, timeouts
-src/solana.ts       read-only handlers, cache, validation, getPriorityFeeEstimate
+src/solana.ts       read handlers, send relay, cache, validation, getPriorityFeeEstimate
+src/codec.ts        base58, PDA derivation (ed25519 on-curve check), legacy/v0 tx decoder
+src/das.ts          DAS proxy + on-chain getAsset/getAssetsByOwner fallback (Metaplex borsh)
+src/txstream.ts     TxWatcher: transactionSubscribe engine (logs topics + getTransaction + filters)
+src/webhooks.ts     WebhookManager: REST CRUD, JSON persistence, delivery w/ retries
+src/limits.ts       per-key token bucket + credits
 src/app.ts          createFastRpc() wiring
 test/*.test.ts      node:test suites + mock Solana node + unpluggable TCP proxy
 ```

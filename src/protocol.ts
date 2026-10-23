@@ -7,8 +7,9 @@ export const enum MsgType {
   Notification = 4,  // id=subId, payload {seq, slot, data}
   Unsubscribe = 5,   // id=subId
   Ping = 6, Pong = 7,
+  Auth = 8,          // payload {apiKey}; must be the first frame when the server requires API keys
 }
-const MAX_TYPE = 7;
+const MAX_TYPE = 8;
 const packr = new Packr({ useRecords: false });
 const unpackr = new Unpackr({ useRecords: false });
 export const HDR = 9;

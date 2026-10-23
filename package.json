@@ -12,7 +12,8 @@
     "serve": "tsx examples/serve.ts",
     "stream": "tsx examples/stream.ts",
     "typecheck": "tsc --noEmit --types node --target es2022 --module nodenext --moduleResolution nodenext --strict --skipLibCheck src/*.ts examples/*.ts test/*.ts",
-    "live": "tsx examples/live-check.ts"
+    "live": "tsx examples/live-check.ts",
+    "live:sim": "tsx examples/live-sim.ts"
   },
   "keywords": [],
   "author": "",

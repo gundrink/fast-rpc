@@ -1,6 +1,13 @@
 // Frame: [u32 length][u8 type][u32 reqId][msgpack payload]
 import { Packr, Unpackr } from "msgpackr";
-export const enum MsgType { Request = 0, Response = 1, Error = 2 }
+export const enum MsgType {
+  Request = 0, Response = 1, Error = 2,
+  // streaming
+  Subscribe = 3,     // id=subId, payload {type, params, fromSeq?, fromSlot?}
+  Notification = 4,  // id=subId, payload {seq, slot, data}
+  Unsubscribe = 5,   // id=subId
+  Ping = 6, Pong = 7,
+}
 const packr = new Packr({ useRecords: false });
 const unpackr = new Unpackr({ useRecords: false });
 const HDR = 9;

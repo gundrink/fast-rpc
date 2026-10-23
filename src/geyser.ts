@@ -58,6 +58,7 @@ export function geyserTxToJson(u: any, blockTime: number | null = null) {
       computeUnitsConsumed: meta.computeUnitsConsumed != null ? num(meta.computeUnitsConsumed) : undefined,
     },
     isVote: !!info.isVote,
+    ...(info.index != null ? { transactionIndex: num(info.index) } : {}),
   };
 }
 

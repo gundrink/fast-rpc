@@ -1,0 +1,1 @@
+{"webhookID":"wh_abc123","wallet":"your-wallet-address","webhookURL":"https://your-server.com/webhook","webhookType":"enhanced","accountAddresses":["ADDRESS_1","ADDRESS_2"],"transactionTypes":["SWAP","NFT_SALE","TRANSFER"],"authHeader":"Bearer your-secret-token"}

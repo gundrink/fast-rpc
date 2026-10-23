@@ -7,7 +7,7 @@ import { TxWatcher, type GetTx } from "./txstream.js";
 import { isPubkey } from "./codec.js";
 import { parseEnhanced, TX_TYPES } from "./enhanced.js";
 
-export interface Webhook { webhookID: string; wallet: string; webhookURL: string; transactionTypes: string[]; accountAddresses: string[]; webhookType: "raw" | "rawDevnet" | "enhanced" | "enhancedDevnet"; authHeader?: string; txnStatus?: "all" | "success" | "failed" }
+export interface Webhook { webhookID: string; wallet: string; webhookURL: string; transactionTypes: string[]; accountAddresses: string[]; webhookType: "raw" | "rawDevnet" | "enhanced" | "enhancedDevnet"; authHeader?: string; txnStatus?: "all" | "success" | "failed"; active?: boolean }
 export interface WebhookOptions {
   /** JSON-RPC caller used for restart backfill (getSignaturesForAddress + getTransaction) */
   rpc?: (method: string, params: any[]) => Promise<any>;
@@ -40,8 +40,8 @@ export class WebhookManager {
         for (const h of JSON.parse(fs.readFileSync(this.o.file, "utf8")) as Webhook[]) this.hooks.set(h.webhookID, h);
         const sf = `${this.o.file}.state.json`;
         if (fs.existsSync(sf)) for (const [id, st] of Object.entries<any>(JSON.parse(fs.readFileSync(sf, "utf8")))) if (this.hooks.has(id)) this.stats.set(id, st);
-        for (const h of this.hooks.values()) this.start(h);
-        this.ready = Promise.all([...this.hooks.values()].map((h) => this.backfill(h).catch((e) => this.o.log("[webhooks] backfill failed", h.webhookID, e?.message)))).then(() => {});
+        for (const h of this.hooks.values()) if (h.active !== false) this.start(h);
+        this.ready = Promise.all([...this.hooks.values()].filter((h) => h.active !== false).map((h) => this.backfill(h).catch((e) => this.o.log("[webhooks] backfill failed", h.webhookID, e?.message)))).then(() => {});
       }
       catch (e: any) { this.o.log("[webhooks] failed to load", e.message); }
     }
@@ -161,7 +161,7 @@ export class WebhookManager {
 
   create(wallet: string, body: any): Webhook {
     if ([...this.hooks.values()].filter((h) => h.wallet === wallet).length >= this.o.maxPerKey) throw new WebhookError(429, "webhook limit reached");
-    const h = { webhookID: randomUUID(), wallet, ...this.validate(body) } as Webhook;
+    const h = { webhookID: randomUUID(), wallet, ...this.validate(body), active: true } as Webhook;
     this.hooks.set(h.webhookID, h); this.save(); this.start(h);
     return h;
   }
@@ -169,7 +169,14 @@ export class WebhookManager {
   get(wallet: string, id: string) { const h = this.hooks.get(id); if (!h || h.wallet !== wallet) throw new WebhookError(404, "webhook not found"); return h; }
   update(wallet: string, id: string, body: any) {
     const h = { ...this.get(wallet, id), ...this.validate(body, true) };
-    this.hooks.set(id, h); this.save(); this.stop(id); this.start(h);
+    this.hooks.set(id, h); this.save(); this.stop(id); if (h.active !== false) this.start(h);
+    return h;
+  }
+  /** Helius PATCH /v0/webhooks/:id {active}: pause/resume without deleting */
+  toggle(wallet: string, id: string, body: any) {
+    if (typeof body?.active !== "boolean") throw new WebhookError(400, "active (boolean) is required");
+    const h = { ...this.get(wallet, id), active: body.active };
+    this.hooks.set(id, h); this.save(); this.stop(id); if (h.active) this.start(h);
     return h;
   }
   delete(wallet: string, id: string) { this.get(wallet, id); this.stop(id); this.hooks.delete(id); this.stats.delete(id); this.save(); this.saveState(); }

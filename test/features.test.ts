@@ -46,9 +46,9 @@ before(async () => {
   mock.responses.getMultipleAccounts = (p) => ({ context: { slot: 1 }, value: p[0].map((k: string) =>
     k === MINT ? mintAcc("1000000000", 6) : k === NFT ? mintAcc("1", 0) : META[k] ? { owner: "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s", data: [META[k], "base64"] } : null) });
   mock.responses.getTokenAccountsByOwner = (p) => ({ context: { slot: 1 }, value: p[1].programId.startsWith("Tokenkeg") ? [
-    { pubkey: pk(), account: { data: { parsed: { info: { mint: MINT, owner: p[0], state: "initialized", tokenAmount: { amount: "5000000" } } } } } },
-    { pubkey: pk(), account: { data: { parsed: { info: { mint: NFT, owner: p[0], state: "frozen", tokenAmount: { amount: "1" } } } } } },
-    { pubkey: pk(), account: { data: { parsed: { info: { mint: pk(), owner: p[0], state: "initialized", tokenAmount: { amount: "0" } } } } } },
+    { pubkey: pk(), account: { data: { parsed: { info: { mint: MINT, owner: p[0], state: "initialized", tokenAmount: { amount: "5000000", decimals: 6 } } } } } },
+    { pubkey: pk(), account: { data: { parsed: { info: { mint: NFT, owner: p[0], state: "frozen", tokenAmount: { amount: "1", decimals: 0 } } } } } },
+    { pubkey: pk(), account: { data: { parsed: { info: { mint: pk(), owner: p[0], state: "initialized", tokenAmount: { amount: "0", decimals: 6 } } } } } },
   ] : [] });
   dasMock.responses.getAssetProof = (p) => ({ root: "R", proof: ["a"], node_index: 1, leaf: "L", tree_id: (p as any).id });
   whFile = path.join(tmp(), "webhooks.json");
@@ -143,20 +143,21 @@ test("DAS fallback: getAsset (fungible + NFT w/ Metaplex metadata)", async () =>
 });
 
 test("DAS fallback: getAssetsByOwner (hides zero balances, paging, ownership)", async () => {
-  const r = (await rpc("getAssetsByOwner", { ownerAddress: OWNER, page: 1, limit: 10 })).result;
+  // Helius: fungibles only with displayOptions.showFungible
+  assert.equal((await rpc("getAssetsByOwner", { ownerAddress: OWNER })).result.total, 1);
+  const r = (await rpc("getAssetsByOwner", { ownerAddress: OWNER, page: 1, limit: 10, displayOptions: { showFungible: true } })).result;
   assert.equal(r.total, 2); assert.equal(r.items.length, 2);
   const n = r.items.find((i: any) => i.id === NFT);
   assert.equal(n.ownership.owner, OWNER); assert.equal(n.ownership.frozen, true); assert.equal(n.ownership.ownership_model, "single");
-  assert.equal((await rpc("getAssetsByOwner", { ownerAddress: OWNER, displayOptions: { showZeroBalance: true } })).result.total, 3);
-  assert.equal((await rpc("getAssetsByOwner", { ownerAddress: OWNER, page: 2, limit: 1 })).result.items.length, 1);
+  assert.equal((await rpc("getAssetsByOwner", { ownerAddress: OWNER, displayOptions: { showZeroBalance: true, showFungible: true } })).result.total, 3);
+  assert.equal((await rpc("getAssetsByOwner", { ownerAddress: OWNER, page: 2, limit: 1, displayOptions: { showFungible: true } })).result.items.length, 1);
   assert.equal((await rpc("getAssetsByOwner", {})).error.code, -32602);
 });
 
 test("DAS: methods w/o fallback need DAS_RPC_URL; DAS_RPC_URL proxies everything", async () => {
-  for (const m of ["getSignaturesForAsset", "getAssetsByCreator"]) {
-    const r = await rpc(m, { id: A });
-    assert.equal(r.error.code, -32601); assert.match(r.error.message, /DAS_RPC_URL/);
-  }
+  // every DAS method now has a local fallback (Helius params validated)
+  assert.deepEqual((await rpc("getAssetsByCreator", { creatorAddress: A })).result, { total: 0, limit: 100, page: 1, items: [] });
+  assert.equal((await rpc("getAssetsByCreator", { id: A })).error.code, -32602);
   // now served from the local index (empty here): proof not found, bad group params rejected
   assert.equal((await rpc("getAssetProof", { id: A })).error.code, -32000);
   assert.equal((await rpc("getAssetsByGroup", { groupKey: "creator", groupValue: A })).error.code, -32602);

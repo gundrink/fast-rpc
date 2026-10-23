@@ -46,7 +46,7 @@ export function matchesFilter(f: TxFilter, keys: string[], failed: boolean): boo
   return true;
 }
 
-export interface TxEvent { signature: string; slot: number; tx: any }
+export interface TxEvent { signature: string; slot: number; tx: any; transactionIndex?: number }
 
 export class TxWatcher {
   private detach: (() => void)[] = [];
@@ -77,8 +77,8 @@ export class TxWatcher {
     this.seen.add(sig); this.seenQ.push(sig); if (this.seenQ.length > 20_000) this.seen.delete(this.seenQ.shift()!);
     if ((r.isVote && this.filter.vote !== true) || !matchesFilter(this.filter, txAccountKeys(r), !!r.meta?.err)) { this.stats.filtered++; return; }
     this.stats.matched++;
-    const { isVote, ...tx } = r;
-    try { this.onTx({ signature: sig, slot: r.slot, tx }); } catch {}
+    const { isVote, transactionIndex, ...tx } = r;
+    try { this.onTx({ signature: sig, slot: r.slot, tx, transactionIndex }); } catch {}
   }
   private async replay(rec: any, fromSlot: number) {
     for await (const r of rec.replay(fromSlot)) {
@@ -87,8 +87,8 @@ export class TxWatcher {
       if ((r.vote && this.filter.vote !== true) || !matchesFilter(this.filter, r.keys, r.failed)) continue;
       this.seen.add(r.sig); this.seenQ.push(r.sig);
       this.stats.matched++;
-      const { isVote, ...tx } = r.tx;
-      try { this.onTx({ signature: r.sig, slot: r.slot, tx }); } catch {}
+      const { isVote, transactionIndex, ...tx } = r.tx;
+      try { this.onTx({ signature: r.sig, slot: r.slot, tx, transactionIndex }); } catch {}
     }
   }
   private onLog(e: Entry) {
@@ -131,6 +131,18 @@ export class TxWatcher {
 export function heliusTxResult(e: TxEvent, details: TxOptions["transactionDetails"] = "full") {
   const r = e.tx;
   const inner = details === "signatures" ? { signatures: Array.isArray(r.transaction) ? undefined : r.transaction?.signatures, meta: r.meta }
-    : details === "none" ? { meta: r.meta } : { transaction: r.transaction, meta: r.meta };
-  return { transaction: { ...inner, version: r.version ?? "legacy" }, signature: e.signature, slot: e.slot };
+    : details === "none" ? { meta: r.meta }
+    : details === "accounts" ? { transaction: accountsView(r), meta: r.meta ? (({ innerInstructions, logMessages, ...m }: any) => m)(r.meta) : r.meta }
+    : { transaction: r.transaction, meta: r.meta };
+  return { transaction: { ...inner, version: r.version ?? "legacy" }, signature: e.signature, slot: e.slot, ...(e.transactionIndex != null ? { transactionIndex: e.transactionIndex } : {}) };
+}
+/** Solana transactionDetails:"accounts" view: signatures + accountKeys {pubkey, writable, signer, source} */
+function accountsView(r: any) {
+  const m = r.transaction?.message; if (!m || Array.isArray(r.transaction)) return r.transaction;
+  const h = m.header ?? {}; const st: string[] = (m.accountKeys ?? []).map((k: any) => (typeof k === "string" ? k : k.pubkey));
+  const nSig = h.numRequiredSignatures ?? 0, roS = h.numReadonlySignedAccounts ?? 0, roU = h.numReadonlyUnsignedAccounts ?? 0;
+  const keys = st.map((pubkey, i) => ({ pubkey, signer: i < nSig, writable: i < nSig ? i < nSig - roS : i < st.length - roU, source: "transaction" }));
+  for (const pubkey of r.meta?.loadedAddresses?.writable ?? []) keys.push({ pubkey, signer: false, writable: true, source: "lookupTable" });
+  for (const pubkey of r.meta?.loadedAddresses?.readonly ?? []) keys.push({ pubkey, signer: false, writable: false, source: "lookupTable" });
+  return { signatures: r.transaction.signatures, accountKeys: keys };
 }

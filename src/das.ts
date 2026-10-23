@@ -12,6 +12,19 @@ export const TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 export const TOKEN_2022 = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 export const DAS_METHODS = ["getAsset", "getAssetBatch", "getAssetsByOwner", "getAssetsByGroup", "getAssetsByCreator", "getAssetsByAuthority", "searchAssets", "getAssetProof", "getAssetProofBatch", "getSignaturesForAsset", "getTokenAccounts", "getNftEditions"] as const;
 
+export const editionPda = (mint: string) =>
+  findProgramAddress([Buffer.from("metadata"), b58decode(METADATA_PROGRAM), b58decode(mint), Buffer.from("edition")], METADATA_PROGRAM)[0];
+
+/** Helius sortBy {sortBy: created|updated|recent_action|id|none, sortDirection: asc|desc} (local: compression leaf/seq, else id) */
+export function sortAssets(items: any[], sb: any) {
+  if (!sb || sb.sortBy === "none" || sb.sortBy == null) return items;
+  if (!["created", "updated", "recent_action", "id"].includes(sb.sortBy)) throw INVALID_PARAMS(`sortBy.sortBy must be created|updated|recent_action|id|none`);
+  const dir = sb.sortDirection === "asc" ? 1 : sb.sortDirection === "desc" || sb.sortDirection == null ? -1 : NaN;
+  if (Number.isNaN(dir)) throw INVALID_PARAMS("sortBy.sortDirection must be asc|desc");
+  const key = (a: any) => sb.sortBy === "id" ? a.id : sb.sortBy === "created" ? (a.compression?.leaf_id ?? 0) : (a.compression?.seq ?? 0);
+  return [...items].sort((x, y) => { const a = key(x), b = key(y); return (a < b ? -1 : a > b ? 1 : 0) * dir; });
+}
+
 export const metadataPda = (mint: string) =>
   findProgramAddress([Buffer.from("metadata"), b58decode(METADATA_PROGRAM), b58decode(mint)], METADATA_PROGRAM)[0];
 
@@ -107,7 +120,19 @@ export function createDas(up: Up, dasUp?: Up, cnft?: CnftIndexer, extras: DasExt
 
   const paging = (p: any) => ({ limit: Math.min(Math.max(Number(p?.limit ?? 100), 1), 1000), page: Math.max(Number(p?.page ?? 1), 1) });
   const cnftOf = (pred: (a: CnftAsset) => boolean) => cnft?.enabled ? cnft.list(pred).map((a) => cnft.toDas(a)) : [];
-  const page = (all: any[], p: any) => { const { limit, page } = paging(p); return { total: all.length, limit, page, items: all.slice((page - 1) * limit, page * limit) }; };
+  const page = (all: any[], p: any) => {
+    const { limit, page } = paging(p); all = sortAssets(all, p?.sortBy);
+    // Helius keyset pagination: cursor/after (id > x) or before (id < x), ordered by id
+    const cur = p?.cursor ?? p?.after;
+    if (cur != null || p?.before != null) {
+      let l = [...all].sort((x, y) => (x.id < y.id ? -1 : x.id > y.id ? 1 : 0));
+      if (cur != null) l = l.filter((x) => x.id > cur);
+      if (p?.before != null) l = l.filter((x) => x.id < p.before);
+      const items = l.slice(0, limit);
+      return { total: items.length, limit, cursor: items.at(-1)?.id ?? null, items };
+    }
+    return { total: all.length, limit, page, items: all.slice((page - 1) * limit, page * limit) };
+  };
   const proof = (id: any) => {
     if (!isPubkey(id)) throw INVALID_PARAMS("getAssetProof: params.id must be an asset id");
     const r = cnft?.proof(id); if (!r) throw new RpcError(-32000, "Asset proof not found (only CNFT_TREES-indexed compressed assets)"); return r;
@@ -115,11 +140,11 @@ export function createDas(up: Up, dasUp?: Up, cnft?: CnftIndexer, extras: DasExt
   const ownerTokens = async (owner: string, showZero: boolean) => {
     const [t1, t2] = await Promise.all([TOKEN_PROGRAM, TOKEN_2022].map((programId) =>
       up("getTokenAccountsByOwner", [owner, { programId }, { encoding: "jsonParsed" }], 1000).catch(() => ({ value: [] }))));
-    const owners = new Map<string, { owner: string; frozen: boolean; amount?: string }>();
+    const owners = new Map<string, { owner: string; frozen: boolean; amount?: string; decimals?: number }>();
     for (const a of [...(t1?.value ?? []), ...(t2?.value ?? [])]) {
       const info = a.account?.data?.parsed?.info; if (!info) continue;
       if (!showZero && info.tokenAmount?.amount === "0") continue;
-      owners.set(info.mint, { owner, frozen: info.state === "frozen", amount: info.tokenAmount?.amount });
+      owners.set(info.mint, { owner, frozen: info.state === "frozen", amount: info.tokenAmount?.amount, decimals: info.tokenAmount?.decimals });
     }
     return owners;
   };
@@ -181,18 +206,86 @@ export function createDas(up: Up, dasUp?: Up, cnft?: CnftIndexer, extras: DasExt
       const m = new Map(rest.map((i, j) => [i, fetched[j]]));
       return enrich(ids.map((i) => local.get(i) ?? m.get(i) ?? null), p);
     },
+    getAssetsByCreator: async (p: any) => {
+      if (!isPubkey(p?.creatorAddress)) throw INVALID_PARAMS("getAssetsByCreator: params.creatorAddress required");
+      return enrich(page(cnftOf((a) => !a.burnt && a.metadata.creators.some((c) => c.address === p.creatorAddress && (!p.onlyVerified || c.verified))), p), p);
+    },
+    getAssetsByAuthority: async (p: any) => {
+      if (!isPubkey(p?.authorityAddress)) throw INVALID_PARAMS("getAssetsByAuthority: params.authorityAddress required");
+      const items = cnftOf((a) => !a.burnt).filter((x: any) => x.authorities?.some((u: any) => u.address === p.authorityAddress));
+      return enrich(page(items, p), p);
+    },
+    getSignaturesForAsset: async (p: any) => {
+      if (!isPubkey(p?.id)) throw INVALID_PARAMS("getSignaturesForAsset: params.id must be an asset id");
+      const { limit, page: pg } = paging(p);
+      let all: [string, string][];
+      if (cnft?.has(p.id)) all = [...(cnft.history.get(p.id) ?? [])].reverse(); // newest first
+      else {
+        const sigs = await up("getSignaturesForAddress", [p.id, { limit: Math.min(1000, pg * limit) }], 1000);
+        all = (sigs ?? []).map((x: any) => [x.signature, "Unknown"] as [string, string]);
+      }
+      return { total: all.length, limit, page: pg, items: all.slice((pg - 1) * limit, pg * limit) };
+    },
+    getTokenAccounts: async (p: any = {}) => {
+      if (p.mint === undefined && p.owner === undefined) throw INVALID_PARAMS("getTokenAccounts: params.mint or params.owner required");
+      if ((p.mint !== undefined && !isPubkey(p.mint)) || (p.owner !== undefined && !isPubkey(p.owner))) throw INVALID_PARAMS("getTokenAccounts: mint/owner must be pubkeys");
+      const { limit, page: pg } = paging(p);
+      let raw: { pubkey: string; data: Buffer; program: string }[] = [];
+      const b64 = (a: any) => Buffer.from(a.account?.data?.[0] ?? "", "base64");
+      if (p.owner) {
+        const rs = await Promise.all([TOKEN_PROGRAM, TOKEN_2022].map((programId) =>
+          up("getTokenAccountsByOwner", [p.owner, p.mint ? { mint: p.mint } : { programId }, { encoding: "base64" }], 1000).catch(() => ({ value: [] }))));
+        const seen = new Set<string>();
+        rs.forEach((r, i) => { for (const a of r?.value ?? []) if (!seen.has(a.pubkey)) { seen.add(a.pubkey); raw.push({ pubkey: a.pubkey, data: b64(a), program: a.account?.owner ?? [TOKEN_PROGRAM, TOKEN_2022][i] }); } });
+      } else {
+        const rs = await Promise.all([TOKEN_PROGRAM, TOKEN_2022].map((prog) =>
+          up("getProgramAccounts", [prog, { encoding: "base64", filters: [...(prog === TOKEN_PROGRAM ? [{ dataSize: 165 }] : []), { memcmp: { offset: 0, bytes: p.mint } }] }], 1000).catch(() => [])));
+        rs.forEach((r, i) => { for (const a of (Array.isArray(r) ? r : r?.value ?? [])) raw.push({ pubkey: a.pubkey, data: b64(a), program: [TOKEN_PROGRAM, TOKEN_2022][i] }); });
+      }
+      let accs = raw.filter((x) => x.data.length >= 165).map((x) => ({
+        address: x.pubkey, mint: b58encode(x.data.subarray(0, 32)), owner: b58encode(x.data.subarray(32, 64)),
+        amount: Number(x.data.readBigUInt64LE(64)), delegated_amount: Number(x.data.readBigUInt64LE(121)), frozen: x.data[108] === 2,
+      }));
+      if (!p.options?.showZeroBalance && !p.displayOptions?.showZeroBalance) accs = accs.filter((a) => a.amount > 0);
+      accs.sort((a, b) => (a.address < b.address ? -1 : 1));
+      const cur = p.cursor ?? p.after;
+      if (cur != null || p.before != null) {
+        const l = accs.filter((a) => (cur == null || a.address > cur) && (p.before == null || a.address < p.before)).slice(0, limit);
+        return { total: l.length, limit, cursor: l.at(-1)?.address ?? null, token_accounts: l };
+      }
+      return { total: accs.length, limit, page: pg, token_accounts: accs.slice((pg - 1) * limit, pg * limit) };
+    },
+    getNftEditions: async (p: any) => {
+      if (!isPubkey(p?.mint)) throw INVALID_PARAMS("getNftEditions: params.mint must be a master edition mint");
+      const { limit, page: pg } = paging(p);
+      const master = editionPda(p.mint);
+      const me = await up("getAccountInfo", [master, { encoding: "base64" }], 1000);
+      const d = me?.value?.data?.[0] ? Buffer.from(me.value.data[0], "base64") : undefined;
+      if (!d || (d[0] !== 6 && d[0] !== 2)) throw new RpcError(-32000, "Master edition not found");
+      const supply = Number(d.readBigUInt64LE(1)); const max_supply = d[9] === 1 ? Number(d.readBigUInt64LE(10)) : null;
+      const r = await up("getProgramAccounts", [METADATA_PROGRAM, { encoding: "base64", dataSlice: { offset: 33, length: 8 }, filters: [{ memcmp: { offset: 0, bytes: "2" } }, { memcmp: { offset: 1, bytes: master } }] }], 1000);
+      const list = (Array.isArray(r) ? r : r?.value ?? []).map((a: any) => ({ mint: null as string | null, edition_address: a.pubkey, edition: Number(Buffer.from(a.account.data[0], "base64").readBigUInt64LE(0)) }))
+        .sort((a: any, b: any) => a.edition - b.edition);
+      return { total: list.length, limit, page: pg, master_edition_address: master, supply, max_supply, editions: list.slice((pg - 1) * limit, pg * limit) };
+    },
     getAssetsByOwner: async (p: any) => {
       const owner = p?.ownerAddress;
       if (!isPubkey(owner)) throw INVALID_PARAMS("getAssetsByOwner: params.ownerAddress required");
       const { limit, page } = paging(p);
-      const owners = await ownerTokens(owner, !!p.displayOptions?.showZeroBalance);
-      const compressed = cnftOf((a) => a.owner === owner && !a.burnt);
+      const d = p.displayOptions ?? {};
+      const owners = await ownerTokens(owner, !!d.showZeroBalance);
+      // Helius: fungible tokens only with displayOptions.showFungible (decimals > 0 => fungible)
+      if (!d.showFungible) for (const [m, o] of owners) if (o.decimals !== 0) owners.delete(m);
+      const compressed = sortAssets(cnftOf((a) => a.owner === owner && !a.burnt), p.sortBy);
       const all = [...owners.keys()].sort();
       const start = (page - 1) * limit;
       const c = compressed.slice(start, start + limit);
       const pageMints = all.slice(Math.max(0, start - compressed.length), Math.max(0, start - compressed.length) + (limit - c.length));
       const items = [...c, ...(await fetchAssets(pageMints, owners)).filter(Boolean)];
-      return enrich({ total: all.length + compressed.length, limit, page, items }, p);
+      const out: any = { total: all.length + compressed.length, limit, page, items };
+      if (d.showGrandTotal) out.grand_total = out.total;
+      if (d.showNativeBalance) { const b = await up("getBalance", [owner], 1000); out.nativeBalance = { lamports: b?.value ?? b ?? 0, price_per_sol: 0, total_price: 0 }; }
+      return enrich(out, p);
     },
   };
 }

@@ -1,3 +1,4 @@
+import { parseTransactions, addressTransactions, HttpError } from "./history.js";
 import net from "node:net";
 import http from "node:http";
 import { WebSocketServer, WebSocket } from "ws";
@@ -110,7 +111,8 @@ export class RpcServer {
     return !!k && this.o.apiKeys.includes(k);
   }
 
-  private keyOf(url = "/") { return new URL(url, "http://x").searchParams.get("api-key") || "anonymous"; }
+  /** auth off (no API_KEYS): ?api-key= is accepted but ignored, everyone shares the "anonymous" bucket */
+  private keyOf(url = "/") { return this.o.apiKeys.length ? new URL(url, "http://x").searchParams.get("api-key") || "anonymous" : "anonymous"; }
 
   private async dispatch(method: string, params: any, key = "anonymous") {
     const fn = this.handlers.get(method);
@@ -153,7 +155,8 @@ export class RpcServer {
     const dec = new FrameDecoder((type, id, payload) => {
       if (type === MsgType.Auth) {
         const k = payload?.apiKey;
-        if (typeof k === "string" && (!this.o.apiKeys.length || this.o.apiKeys.includes(k))) { key = k; send(encode(MsgType.Response, id, { ok: true })); }
+        if (!this.o.apiKeys.length) { key = "anonymous"; send(encode(MsgType.Response, id, { ok: true })); }
+        else if (typeof k === "string" && this.o.apiKeys.includes(k)) { key = k; send(encode(MsgType.Response, id, { ok: true })); }
         else { send(encode(MsgType.Error, id, "Unauthorized: invalid api key")); sock.end(); }
         return;
       }
@@ -242,11 +245,11 @@ export class RpcServer {
     const url = new URL(req.url ?? "/", "http://x");
     res.setHeader("Access-Control-Allow-Origin", "*");
     if (req.method === "OPTIONS") {
-      res.writeHead(204, { "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS", "Access-Control-Allow-Headers": "content-type, solana-client" });
+      res.writeHead(204, { "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS", "Access-Control-Allow-Headers": "content-type, solana-client" });
       return void res.end();
     }
     if (req.method === "GET" && url.pathname === "/health") { res.writeHead(200, { "content-type": "text/plain" }); return void res.end("ok"); }
-    if (!this.authorized(req.url)) return this.json(res, 401, rpcErr(null, -32401, "Unauthorized: invalid or missing api-key"));
+    if (!this.authorized(req.url)) return this.json(res, 401, rpcErr(null, -32001, "Unauthorized: invalid or missing api-key"));
     const key = this.keyOf(req.url);
     if (req.method === "GET" && url.pathname === "/stream") {
       try { this.o.limiter.take(key, "subscribe"); } catch (e: any) { return this.json(res, 429, rpcErr(null, e.code, e.message)); }
@@ -254,6 +257,8 @@ export class RpcServer {
     }
     if (req.method === "GET" && url.pathname === "/v0/chain") return this.json(res, 200, this.chain?.status() ?? { consensus: "unknown", reason: "no chain state" });
     if (req.method === "GET" && url.pathname === "/v0/usage") return this.json(res, 200, this.o.limiter.report(key));
+    if ((req.method === "POST" && url.pathname === "/v0/transactions") || (req.method === "GET" && /^\/v0\/addresses\/[^/]+\/transactions$/.test(url.pathname)))
+      return this.enhancedRest(req, res, url, key);
     if (url.pathname === "/v0/webhooks" || url.pathname.startsWith("/v0/webhooks/")) return this.rest(req, res, url, key);
     if (req.method !== "POST") return this.json(res, 405, rpcErr(null, -32600, "Use POST for JSON-RPC"));
     const body = await this.readBody(req, res); if (body === undefined) return;
@@ -279,19 +284,38 @@ export class RpcServer {
     const id = url.pathname.split("/")[3];
     try {
       this.o.limiter.take(key, "webhook");
-      const body = req.method === "POST" || req.method === "PUT" ? await this.readBody(req, res) : "";
+      const body = req.method === "POST" || req.method === "PUT" || req.method === "PATCH" ? await this.readBody(req, res) : "";
       if (body === undefined) return;
       const parse = () => { try { return JSON.parse(body); } catch { throw new WebhookError(400, "invalid JSON body"); } };
       if (!id && req.method === "POST") return this.json(res, 200, this.webhooks.create(key, parse()));
       if (!id && req.method === "GET") return this.json(res, 200, this.webhooks.list(key));
       if (id && req.method === "GET") return this.json(res, 200, this.webhooks.get(key, id));
       if (id && req.method === "PUT") return this.json(res, 200, this.webhooks.update(key, id, parse()));
+      if (id && req.method === "PATCH") return this.json(res, 200, this.webhooks.toggle(key, id, parse()));
       if (id && req.method === "DELETE") { this.webhooks.delete(key, id); res.writeHead(200); return void res.end(); }
       return this.json(res, 405, { error: "method not allowed" });
     } catch (e: any) {
       if (e instanceof WebhookError) return this.json(res, e.status, { error: e.message });
       if (e instanceof RpcError && e.code === -32429) return this.json(res, 429, { error: e.message });
       throw e;
+    }
+  }
+
+  /** Helius Enhanced Transactions REST: POST /v0/transactions, GET /v0/addresses/:address/transactions */
+  private async enhancedRest(req: http.IncomingMessage, res: http.ServerResponse, url: URL, key: string) {
+    const call = (m: string, p: any[]) => { const fn = this.handlers.get(m); if (!fn) throw new RpcError(-32601, "Method not found"); return Promise.resolve(fn(...p)); };
+    try {
+      this.o.limiter.take(key, "enhanced");
+      if (req.method === "POST") {
+        const body = await this.readBody(req, res); if (body === undefined) return;
+        let j: any; try { j = JSON.parse(body); } catch { return this.json(res, 400, { error: "invalid JSON body" }); }
+        return this.json(res, 200, await parseTransactions(call, j));
+      }
+      return this.json(res, 200, await addressTransactions(call, decodeURIComponent(url.pathname.split("/")[3]), url.searchParams));
+    } catch (e: any) {
+      if (e instanceof HttpError) return this.json(res, e.status, { error: e.message });
+      if (e instanceof RpcError && e.code === -32429) return this.json(res, 429, { error: e.message });
+      return this.json(res, 500, { error: String(e?.message ?? e) });
     }
   }
 

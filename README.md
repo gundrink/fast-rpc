@@ -103,6 +103,14 @@ REST, scoped to the api key: `POST /v0/webhooks`, `GET /v0/webhooks`, `GET|PUT|D
 - **Persistence/backfill:** delivery stats (`delivered/failed/retries/lastError/lastSlot/backfilled`) persist to `WEBHOOKS_FILE.state.json`. On restart, each webhook catches up on txs with slot > `lastSlot`: the newest `backfillLimit` (200) signatures per address, oldest first, deduped by signature.
 
 ### Auth, rate limits, credits
+- **Auth is OFF by default (internal deployment).**
+  - With `API_KEYS` unset, nothing is checked on any transport (HTTP, WS, SSE, binary, `/v0/webhooks`, `/v0/transactions`, `/v0/addresses/…`, `/v0/usage`).
+  - `?api-key=` is accepted but ignored, so Helius URLs work as-is. Everyone shares the `anonymous` limit bucket and webhook namespace.
+  - The binary port needs no Auth frame. An Auth frame with any key is acknowledged.
+  - To re-enable, set `API_KEYS=k1,k2`. A bad or missing key then gets `401` with `{"error":{"code":-32001,"message":"Unauthorized: …"}}`.
+- **Bind address:** the server listens on `127.0.0.1` by default, so it is not reachable from other hosts.
+  - Set `HOST` to expose it on an internal interface, e.g. `HOST=10.0.0.5 PORT=7070 npm run serve`.
+  - Only use `HOST=0.0.0.0` behind a firewall or private network, since auth is off.
 - **Binary port**: when `API_KEYS` is set, the first frame must be `Auth=8 {apiKey}`. Anything else (except Ping) gets an Error frame and the connection is closed. `RpcClient.connect(port, host, {apiKey})` re-authenticates on every reconnect, and a rejected key stops reconnecting.
 - **Per-key limits** (all transports): token bucket `rps`/`burst` and a `credits` budget per key.
   - Configure with `KEY_LIMITS='{"KEY":{"rps":50,"credits":1000000}}'`, plus `DEFAULT_RPS` / `DEFAULT_CREDITS` for other keys.
@@ -123,21 +131,32 @@ await unsub();
 
 ## Helius compatibility
 
-| Feature | Status |
-|---|---|
-| URL `/?api-key=KEY` | ✅ HTTP, WS and SSE. Keys are checked against `API_KEYS` (comma list). With no keys set, the endpoint is open. Bad or missing key → `401`. |
-| HTTP JSON-RPC 2.0 (single, batch, id echo, error codes) | ✅ |
-| `GET /health` | ✅ |
-| Read methods | ✅ `getHealth getVersion getSlot getBlockHeight getEpochInfo getLatestBlockhash getBalance getAccountInfo getMultipleAccounts(≤100) getTransaction getSignaturesForAddress(limit≤1000) getSignatureStatuses(≤256) getBlock getBlockTime getProgramAccounts(result cap GPA_MAX_RESULTS) getTokenAccountsByOwner getTokenAccountBalance getTokenSupply getMinimumBalanceForRentExemption getRecentPrioritizationFees` |
-| `getPriorityFeeEstimate` | ⚠️ Same request/response shape (`priorityLevel`, `includeAllPriorityFeeLevels`, `priorityFeeLevels{min,low,medium,high,veryHigh,unsafeMax}`). Accepts `accountKeys` **or a serialized `transaction`** (base58 default, `options.transactionEncoding:"Base64"`), whose static keys are decoded locally. Values are **approximated** from percentiles of `getRecentPrioritizationFees`. |
-| `sendTransaction` / `simulateTransaction` | ✅ relay + multi-upstream fan-out + Sender-style Jito dual send (tip validated); no staked connections |
-| Jito `sendBundle` / `getBundleStatuses` / `getInflightBundleStatuses` / `getTipAccounts` | ✅ relayed to `JITO_URL`, bundles tip-validated |
-| DAS | ✅ proxied with `DAS_RPC_URL`; ⚠️ otherwise on-chain fallback + local cNFT index (`CNFT_TREES`) + local `searchAssets`/`getAssetsByGroup` |
-| `transactionSubscribe` | ✅ native with `GEYSER_URL` (≤50k accounts); ⚠️ logs+getTransaction backend otherwise |
-| Webhooks | ⚠️ `raw` + `enhanced` (TRANSFER / SWAP / NFT_SALE / cNFT types only), restart backfill |
-| Per-key rate limits / credits, `401`/`429` | ✅ (in-memory) |
-| Standard WS pubsub: `account/program/logs/signature/slot/root` `Subscribe`/`Unsubscribe` | ✅ Notification JSON is the exact upstream result (`{jsonrpc, method:"xNotification", params:{result, subscription}}`). An unknown subscription id → `-32602 "Invalid subscription id."`. |
-| Notification shapes | ✅ Checked live against mainnet (`npm run live`): proxy and direct-mainnet responses have identical key/type shapes. |
+Audited against the Helius docs (`helius.dev/docs/llms.txt` and the API-reference indexes, fetched 2026-10-24). `test/parity.test.ts` checks our response field names and types against Helius doc examples kept in `test/fixtures/helius/`.
+
+Legend: ✅ matches · ⚠️ approximated (same request/response shape, data derived from standard RPC) · ❌ not possible without Helius infrastructure.
+
+| Area | Endpoint / method | Status | Notes |
+|---|---|---|---|
+| Auth | `?api-key=` on all transports | ✅ | Ignored by default. Enforced only when `API_KEYS` is set: `401` with code `-32001`. |
+| Errors | JSON-RPC `-32600/-32601/-32602/-32603`; REST `{"error": "..."}` with 400/401/429/500 | ✅ | Rate limit uses `-32429` with HTTP 429 (Helius DAS docs list `-32005`; Helius RPC uses `-32429`). |
+| RPC | Standard Solana read methods, `sendTransaction`, `simulateTransaction` | ✅ | Relayed. No staked connections or SWQoS. |
+| RPC | `getPriorityFeeEstimate` | ⚠️ | All options are accepted: `priorityLevel`, `includeAllPriorityFeeLevels`, `transactionEncoding`, `lookbackSlots` (1–150), `includeVote`, `recommended`, `evaluateEmptySlotAsZero`. With all levels requested, the response carries both `priorityFeeEstimate` and `priorityFeeLevels`. `recommended` is medium with a 10,000 floor (`PRIORITY_FEE_FLOOR`). Values are percentiles of `getRecentPrioritizationFees`. `includeVote` is a no-op (votes are not in blocks after Alpenglow). |
+| RPC | `getTransactionsForAddress` | ⚠️ | Supports `transactionDetails` `signatures`/`full`, `sortOrder`, `limit`, `paginationToken` (`"slot:position"`), and filters `slot`/`blockTime`/`signature`/`status`/`tokenAccounts`. Response is `{data, paginationToken}`. Built on `getSignaturesForAddress` (scan cap `GTFA_SCAN_MAX` 10000) plus `getTransaction` (full limit `GTFA_FULL_MAX` 100, vs Helius 1000). `transactionIndex` is the position within the slot as seen by RPC, not the block index. `filters.tokenTransfer` is not implemented. |
+| Enhanced | `POST /v0/transactions` `{transactions ≤100, commitment}` | ⚠️ | Helius payload fields: `description, type, source, fee, feePayer, signature, slot, timestamp, nativeTransfers, tokenTransfers, accountData, transactionError, instructions, events`. Our parser covers about 25 types; Helius covers 500+. |
+| Enhanced | `GET /v0/addresses/{address}/transactions` | ⚠️ | Supports `before-signature`, `after-signature` (also legacy `before`/`until`), `type`, `source`, `limit` (1–100), `commitment`. Type/source filtering scans up to `ENHANCED_SCAN_PAGES` (5) pages of 100. |
+| Webhooks | `POST/GET /v0/webhooks`, `GET/PUT/PATCH/DELETE /v0/webhooks/{id}` | ✅ | The object has `webhookID, wallet, webhookURL, webhookType, accountAddresses, transactionTypes, authHeader, txnStatus, active`. `PATCH {active}` pauses/resumes. `DELETE` returns 200 with no body. Payload is batched. |
+| Webhooks | Enhanced payload types | ⚠️ | Covered: TRANSFER, SWAP (Jupiter/Raydium/Orca), NFT_SALE/LISTING/BID/…, TOKEN_MINT, BURN, STAKE, cNFT. Helius covers far more. |
+| WebSocket | Standard pubsub | ✅ | Exact upstream notifications. |
+| WebSocket | `transactionSubscribe` | ⚠️/✅ | Filters `vote/failed/signature/accountInclude/accountExclude/accountRequired`. Options `commitment/encoding/transactionDetails (full/signatures/accounts/none)/showRewards/maxSupportedTransactionVersion`. Notification is `{transaction:{transaction,meta,version}, signature, slot, transactionIndex}`, with `transactionIndex` only on the Geyser path. Without `GEYSER_URL`: logs+getTransaction backend, 100-account cap. Helius allows 50k accounts. |
+| WebSocket | Enhanced `accountSubscribe`, `preconfSubscribe`, `preprocessedSubscribe`, Parsed Streams | ❌ | Need Helius shred/preconfirmation infrastructure and its IDL catalog. |
+| DAS | `getAsset(Batch)`, `getAssetsByOwner/Group/Creator/Authority`, `searchAssets`, `getAssetProof(Batch)` | ✅ proxied with `DAS_RPC_URL` · ⚠️ local otherwise | `page`/`limit` (≤1000) and `cursor`/`before`/`after` (by id) work. `sortBy {created\|updated\|recent_action\|id\|none, asc\|desc}` sorts by leaf/seq for cNFTs. `displayOptions.showFungible` (fungibles hidden by default, as on Helius), `showZeroBalance`, `showNativeBalance` (`nativeBalance.lamports`; price fields 0), `showGrandTotal`. Creator/authority lookups only see indexed cNFTs. |
+| DAS | `getTokenAccounts` | ✅/⚠️ | `{total, limit, page\|cursor, token_accounts:[{address, mint, owner, amount, delegated_amount, frozen}]}`. By owner via `getTokenAccountsByOwner`; by mint via gPA, subject to the public RPC's gPA limits. |
+| DAS | `getNftEditions` | ⚠️ | `{total, limit, page, master_edition_address, supply, max_supply, editions:[{mint, edition_address, edition}]}`. `mint` is `null` because the edition account does not store it and Helius uses its own index. |
+| DAS | `getSignaturesForAsset` | ⚠️ | `{total, limit, page, items:[[signature, type]]}`. cNFTs use the indexer history (types such as `Transfer`, `MintToCollectionV1`). Other assets use `getSignaturesForAddress(mint)` with type `Unknown`. |
+| DAS | Prices (`token_info.price_info`), off-chain CDN | ❌ | No price feed. Off-chain JSON is opt-in (`DAS_FETCH_JSON=1`). |
+| Sending | Sender (SWQoS, staked), MEV-protect | ❌ | Need staked validator identity. Jito dual send is available instead. |
+| Streaming | LaserStream gRPC (48h replay, multi-node) | ⚠️ | Bring-your-own Geyser (`GEYSER_URL`) plus a 24h local recorder for active filters only. |
+| Other | Parsed Events, Wallet API, ZK Compression (Photon), `getTransfersByAddress` | ❌ | Not implemented. Each needs Helius indexes or a separate indexer. |
 
 ### Honest differences vs Helius
 - **Sending:** still **no staked connections / SWQoS**. That needs a staked validator identity, and Helius's own stake, which a relay cannot provide.
@@ -229,11 +248,11 @@ npm run stream         # streaming demo: slot, account, fan-out, reconnect+repla
 npm run live           # live shape check vs mainnet + 3s logsSubscribe (few calls)
 npm run live:sim       # simulateTransaction (sigVerify:false), priority fee from tx, getAsset fallback; never sends
 
-curl -X POST 'localhost:7070/?api-key=KEY' -d '{"jsonrpc":"2.0","id":1,"method":"getSlot"}'
+curl -X POST 'localhost:7070/' -d '{"jsonrpc":"2.0","id":1,"method":"getSlot"}'
 curl -N 'localhost:7070/stream?type=slot'
-wscat -c 'ws://localhost:7070/?api-key=KEY' -x '{"jsonrpc":"2.0","id":1,"method":"slotSubscribe"}'
+wscat -c 'ws://localhost:7070/' -x '{"jsonrpc":"2.0","id":1,"method":"slotSubscribe"}'
 ```
-Env: `SOLANA_RPC_URL`, `SOLANA_WS_URL` (defaults mainnet-beta public), `SOLANA_TIMEOUT_MS` (10000), `API_KEYS`, `PORT` (7070), `HOST` (127.0.0.1), `STREAM_RING` (2000), `STREAM_SOFT_LIMIT`, `STREAM_HARD_LIMIT`, `STREAM_SLOW_TIMEOUT_MS`, `MAX_FRAME_BYTES`, `GPA_MAX_RESULTS` (10000), `SEND_RPC_URLS`, `DAS_RPC_URL`, `WEBHOOKS_FILE`, `STREAM_PERSIST_DIR`, `STREAM_RETENTION_MS` (3600000), `KEY_LIMITS`, `DEFAULT_RPS`, `DEFAULT_CREDITS`, `TX_FILTER_MAX_ACCOUNTS` (100), `TX_FILTER_MAX_ACCOUNTS_GEYSER` (50000), `GEYSER_URL`, `GEYSER_TOKEN`, `JITO_URL`, `JITO_UUID`, `JITO_MIN_TIP_LAMPORTS` (1000), `SEND_JITO`, `CNFT_TREES`, `CNFT_INDEX_FILE`, `CNFT_BACKFILL`, `CNFT_BACKFILL_MAX` (5000), `SLOT_MS` (200), `CHAIN_TRACK_SLOTS`, `CHAIN_DETECT`, `DEFAULT_COMMITMENT`, `ALPENGLOW_CONFIRMED_AS_FINALIZED`.
+Env: `SOLANA_RPC_URL`, `SOLANA_WS_URL` (defaults mainnet-beta public), `SOLANA_TIMEOUT_MS` (10000), `API_KEYS`, `PORT` (7070), `HOST` (127.0.0.1), `STREAM_RING` (2000), `STREAM_SOFT_LIMIT`, `STREAM_HARD_LIMIT`, `STREAM_SLOW_TIMEOUT_MS`, `MAX_FRAME_BYTES`, `GPA_MAX_RESULTS` (10000), `SEND_RPC_URLS`, `DAS_RPC_URL`, `WEBHOOKS_FILE`, `STREAM_PERSIST_DIR`, `STREAM_RETENTION_MS` (3600000), `KEY_LIMITS`, `DEFAULT_RPS`, `DEFAULT_CREDITS`, `TX_FILTER_MAX_ACCOUNTS` (100), `TX_FILTER_MAX_ACCOUNTS_GEYSER` (50000), `GEYSER_URL`, `GEYSER_TOKEN`, `JITO_URL`, `JITO_UUID`, `JITO_MIN_TIP_LAMPORTS` (1000), `SEND_JITO`, `CNFT_TREES`, `CNFT_INDEX_FILE`, `CNFT_BACKFILL`, `CNFT_BACKFILL_MAX` (5000), `SLOT_MS` (200), `GTFA_SCAN_MAX` (10000), `GTFA_FULL_MAX` (100), `ENHANCED_SCAN_PAGES` (5), `PRIORITY_FEE_FLOOR` (10000), `CHAIN_TRACK_SLOTS`, `CHAIN_DETECT`, `DEFAULT_COMMITMENT`, `ALPENGLOW_CONFIRMED_AS_FINALIZED`.
 The public mainnet endpoint is rate-limited; point `SOLANA_RPC_URL`/`SOLANA_WS_URL` at your own node or a provider for real load.
 
 ## Layout

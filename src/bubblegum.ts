@@ -183,6 +183,15 @@ export class CnftIndexer {
   assets = new Map<string, CnftAsset>();
   trees = new Map<string, TreeState>();
   private seenSigs = new Set<string>();
+  /** per-asset [signature, instruction type] history (newest last, capped) for getSignaturesForAsset */
+  history = new Map<string, [string, string][]>();
+  private curSig?: string;
+  private note(id: string, name?: string) {
+    if (!this.curSig) return;
+    let h = this.history.get(id); if (!h) { h = []; this.history.set(id, h); }
+    if (h.at(-1)?.[0] === this.curSig) return;
+    h.push([this.curSig, name ? name[0].toUpperCase() + name.slice(1) : "Unknown"]); if (h.length > 1000) h.shift();
+  }
   private watcher?: TxWatcher; private saveT?: NodeJS.Timeout;
   stats = { txs: 0, mints: 0, transfers: 0, burns: 0, unknownLeaf: 0, events: 0, updates: 0, redeems: 0, delegates: 0, seqGaps: 0 };
   constructor(private o: IndexerOptions = {}) {
@@ -199,6 +208,7 @@ export class CnftIndexer {
     const sig = r?.transaction?.signatures?.[0];
     if (!r || r.meta?.err || (sig && this.seenSigs.has(sig))) return;
     if (sig) this.seenSigs.add(sig);
+    this.curSig = sig;
     const keys = txAccountKeys(r); const slot = r.slot ?? 0;
     const top = r.transaction?.message?.instructions ?? [];
     const inner = new Map<number, any[]>((r.meta?.innerInstructions ?? []).map((g: any) => [g.index, g.instructions]));
@@ -253,13 +263,13 @@ export class CnftIndexer {
       Object.assign(a, { owner: leaf.owner, delegate: leaf.delegate, nonce: leaf.nonce, leafIndex: cl.index, dataHash: b58encode(leaf.dataHash), creatorHash: b58encode(leaf.creatorHash),
         seq: cl.seq, slot, burnt: false, redeemed: false, version: leaf.version, leafHash: b58encode(node) });
       if (leaf.version === 2) Object.assign(a, { collectionHash: b58encode(leaf.collectionHash!), assetDataHash: b58encode(leaf.assetDataHash!), flags: leaf.flags });
-      t.byIndex.set(cl.index, a.id);
+      t.byIndex.set(cl.index, a.id); this.note(a.id, name);
       return true;
     }
     // no leaf event: burn / redeem (leaf -> zero) or cancel_redeem (voucher leaf restored)
     const id = t.byIndex.get(cl.index); const a = id ? this.assets.get(id) : undefined;
     if (!a) { this.stats.unknownLeaf++; return true; }
-    a.seq = cl.seq; a.slot = slot; a.leafHash = b58encode(node);
+    a.seq = cl.seq; a.slot = slot; a.leafHash = b58encode(node); this.note(a.id, name);
     if (node.equals(ZERO)) {
       if (name === "redeem") { a.redeemed = true; this.stats.redeems++; } else { a.burnt = true; this.stats.burns++; }
     } else { a.redeemed = false; a.burnt = false; }
@@ -297,7 +307,7 @@ export class CnftIndexer {
       const lh = leafHash(id, owner, delegate, nonce, dataHash, creatorHash);
       t.tree.set(nonce, lh); t.seq++; t.lastSlot = slot; t.byIndex.set(nonce, id);
       this.assets.set(id, { id, tree, nonce, leafIndex: nonce, owner, delegate, dataHash: b58encode(dataHash), creatorHash: b58encode(creatorHash), metadata: args, burnt: false, seq: t.seq, slot, version: 1, leafHash: b58encode(lh) });
-      this.stats.mints++; return true;
+      this.stats.mints++; this.note(id, isColl ? "mintToCollectionV1" : "mintV1"); return true;
     }
     const isXfer = d.equals(DISC.transfer), isBurn = d.equals(DISC.burn), isDel = d.equals(DISC.delegate);
     if (!isXfer && !isBurn && !isDel) return false;
@@ -305,7 +315,7 @@ export class CnftIndexer {
     const nonce = Number(body.readBigUInt64LE(96)), index = body.readUInt32LE(104);
     const id = assetId(tree, nonce); const a = this.assets.get(id);
     if (!a) { this.stats.unknownLeaf++; return false; }
-    t.seq++; t.lastSlot = slot; a.seq = t.seq; a.slot = slot;
+    t.seq++; t.lastSlot = slot; a.seq = t.seq; a.slot = slot; this.note(id, isBurn ? "burn" : isXfer ? "transfer" : "delegate");
     if (isBurn) { a.burnt = true; t.tree.set(index, ZERO); a.leafHash = b58encode(ZERO); this.stats.burns++; return true; }
     if (isXfer) { a.owner = acc(3); a.delegate = acc(3); this.stats.transfers++; } else { a.delegate = acc(3); this.stats.delegates++; }
     const lh = leafHash(id, a.owner, a.delegate, nonce, b58decode(a.dataHash), b58decode(a.creatorHash));

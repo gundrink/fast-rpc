@@ -2,6 +2,7 @@
 import { RpcError, INVALID_PARAMS } from "./errors.js";
 import { decodeTransaction } from "./codec.js";
 import { createDas } from "./das.js";
+import { getTransactionsForAddress } from "./history.js";
 import { ChainState } from "./chain.js";
 import { createJito, type JitoOptions } from "./jito.js";
 
@@ -153,6 +154,8 @@ export function createSolanaApi(opts: SolanaApiOptions = {}) {
         throw new RpcError(-32005, `getProgramAccounts returned ${list.length} accounts (> ${gpaMax}); add filters/dataSlice`);
       return r;
     },
+    /** Helius getTransactionsForAddress (built on getSignaturesForAddress + getTransaction) */
+    getTransactionsForAddress: (address: any, cfg?: any) => getTransactionsForAddress((m, p) => (api as any)[m](...p), address, cfg ?? {}),
     /** Helius-style getPriorityFeeEstimate, approximated from getRecentPrioritizationFees percentiles. */
     getPriorityFeeEstimate: async (req: any = {}) => {
       if (req === null || typeof req !== "object") throw INVALID_PARAMS("getPriorityFeeEstimate: params[0] must be an object");
@@ -170,14 +173,18 @@ export function createSolanaApi(opts: SolanaApiOptions = {}) {
       let fees: { slot: number; prioritizationFee: number }[] = await up("getRecentPrioritizationFees", keys.length ? [keys.slice(0, 128)] : [], chain.slots(2));
       // window is expressed in SLOTS (node returns up to 150), not seconds: 150 slots = 60s at 400ms, 30s at 200ms
       if (o0.lookbackSlots) { const top = fees.reduce((m, f) => Math.max(m, f.slot), 0); fees = fees.filter((f) => f.slot > top - o0.lookbackSlots); }
+      // Helius evaluateEmptySlotAsZero (default true): slots without fees count as 0; false => ignore them
+      if (o0.evaluateEmptySlotAsZero === false) fees = fees.filter((f) => f.prioritizationFee > 0);
       const v = fees.map((f) => f.prioritizationFee).sort((x, y) => x - y);
       const pct = (q: number) => (v.length ? v[Math.min(v.length - 1, Math.max(0, Math.ceil((q / 100) * v.length) - 1))] : 0);
       const levels = { min: v[0] ?? 0, low: pct(25), medium: pct(50), high: pct(75), veryHigh: pct(95), unsafeMax: v.at(-1) ?? 0 };
       const o = req.options ?? {};
-      if (o.includeAllPriorityFeeLevels) return { priorityFeeLevels: levels };
       const k = PRIORITY_LEVELS[String(o.priorityLevel ?? "Medium").toLowerCase()];
       if (!k) throw INVALID_PARAMS(`getPriorityFeeEstimate: unknown priorityLevel ${o.priorityLevel}`);
-      return { priorityFeeEstimate: (levels as any)[k] };
+      // Helius `recommended`: medium with a 10,000 microlamport floor
+      const est = o.recommended ? Math.max(levels.medium, Number(process.env.PRIORITY_FEE_FLOOR ?? 10_000)) : (levels as any)[k];
+      if (o.includeAllPriorityFeeLevels) return { priorityFeeEstimate: est, priorityFeeLevels: levels };
+      return { priorityFeeEstimate: est };
     },
   };
   return api;

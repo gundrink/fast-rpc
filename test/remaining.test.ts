@@ -302,7 +302,8 @@ test("enhanced webhooks: transactionTypes filter, enhanced payload, persisted st
     };
     const m2 = new WebhookManager(hub, getTx, { file, rpc, baseDelayMs: 10 });
     await m2.ready; await m2.idle();
-    assert.deepEqual(rv.got.slice(1).map((b) => [b[0].type, b[0].slot]), [["NFT_SALE", 240], ["SWAP", 250]], "only slot > lastSlot, filtered, oldest first");
+    assert.deepEqual(rv.got.slice(1).flat().map((t: any) => [t.type, t.slot]), [["NFT_SALE", 240], ["SWAP", 250]], "only slot > lastSlot, filtered, oldest first");
+    assert.equal(rv.got.length, 2, "backfill delivered as one batched POST");
     assert.equal(rpcCalls.filter((x) => x === "getTransaction").length, 3);
     const st = m2.stats.get(h.webhookID)!;
     assert.equal(st.delivered, 3, "stats carried across restart"); assert.equal(st.lastSlot, 250); assert.equal(st.backfilled, 2);

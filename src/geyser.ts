@@ -3,6 +3,8 @@
 // Anything it can't express (logs/signature/root subs, non-base64 encodings) is delegated to the WS fallback.
 import { b58encode } from "./codec.js";
 import type { Upstream } from "./upstream-ws.js";
+import { decodeTxError } from "./txerror.js";
+import { TxRecorder } from "./recorder.js";
 
 export interface GeyserStream { write(req: any): any; on(ev: string, cb: (...a: any[]) => void): any; destroy?(): void; end?(): void }
 export interface GeyserClientLike { connect?(): Promise<void>; subscribe(): Promise<GeyserStream> }
@@ -13,6 +15,12 @@ export interface GeyserOptions {
   fallback: Upstream;
   log?: (...a: any[]) => void;
   pingMs?: number; minBackoffMs?: number; maxBackoffMs?: number;
+  /** wait this long for the block's blockTime (blocksMeta) before emitting a tx with blockTime:null (GEYSER_BLOCKTIME_WAIT_MS) */
+  blockTimeWaitMs?: number;
+  /** record every streamed tx to disk for fromSlot replay (GEYSER_RECORD dir) */
+  recorder?: TxRecorder;
+  /** extra always-on recording filter (GEYSER_RECORD_ACCOUNTS, comma separated) */
+  recordAccounts?: string[];
 }
 export interface TxStreamFilter { accountInclude?: string[]; accountExclude?: string[]; accountRequired?: string[]; vote?: boolean; failed?: boolean }
 
@@ -21,16 +29,16 @@ const SLOT_PROCESSED = 0, SLOT_FINALIZED = 2;
 const b58 = (u?: Uint8Array) => (u ? b58encode(u) : "");
 const num = (x: any) => (x == null ? 0 : Number(x));
 
-type Sub = { kind: "account" | "program" | "slot" | "tx"; filter: any; cb: (r: any) => void };
+type Sub = { kind: "account" | "program" | "slot" | "tx" | "meta"; filter: any; cb: (r: any) => void };
 
 /** Convert a Yellowstone transaction update into the JSON-RPC getTransaction(encoding:"json") shape. */
-export function geyserTxToJson(u: any) {
+export function geyserTxToJson(u: any, blockTime: number | null = null) {
   const info = u.transaction ?? {}; const tx = info.transaction ?? {}; const m = tx.message ?? {}; const meta = info.meta ?? {};
   const keys: string[] = (m.accountKeys ?? []).map(b58);
   const ix = (i: any) => ({ programIdIndex: i.programIdIndex, accounts: [...(i.accounts ?? [])], data: b58encode(i.data ?? new Uint8Array()), stackHeight: i.stackHeight ?? null });
   const tb = (b: any) => ({ accountIndex: b.accountIndex, mint: b.mint, owner: b.owner, programId: b.programId, uiTokenAmount: b.uiTokenAmount });
   return {
-    slot: num(u.slot), blockTime: null, version: m.versioned ? 0 : "legacy",
+    slot: num(u.slot), blockTime, version: m.versioned ? 0 : "legacy",
     transaction: {
       signatures: (tx.signatures ?? [info.signature]).map(b58),
       message: {
@@ -40,7 +48,8 @@ export function geyserTxToJson(u: any) {
       },
     },
     meta: {
-      err: meta.err ? { geyser: Buffer.from(meta.err.err ?? []).toString("base64") } : null, // raw bincode TransactionError (not decoded)
+      err: meta.err ? decodeTxError(meta.err.err) : null,
+      status: meta.err ? { Err: decodeTxError(meta.err.err) } : { Ok: null },
       fee: num(meta.fee), preBalances: (meta.preBalances ?? []).map(num), postBalances: (meta.postBalances ?? []).map(num),
       innerInstructions: (meta.innerInstructions ?? []).map((g: any) => ({ index: g.index, instructions: (g.instructions ?? []).map(ix) })),
       logMessages: meta.logMessagesNone ? null : (meta.logMessages ?? []),
@@ -59,6 +68,7 @@ class CommitmentStream {
   subs = new Map<string, Sub>();
   private stream?: GeyserStream; private closed = false; private backoff: number; private pingT?: NodeJS.Timeout; private writeQueued = false;
   private root = 0; private lastSlot = 0;
+  private blockTimes = new Map<number, number>(); private pending = new Map<number, { u: any; filters: string[] }[]>();
   constructor(private g: GeyserUpstream, readonly commitment: number) { this.backoff = g.o.minBackoffMs; }
   async ensure() {
     if (this.stream || this.closed) return;
@@ -84,8 +94,9 @@ class CommitmentStream {
     for (const [name, s] of this.subs) {
       if (s.kind === "account" || s.kind === "program") req.accounts[name] = s.filter;
       else if (s.kind === "slot") req.slots[name] = { filterByCommitment: false };
-      else req.transactions[name] = s.filter;
+      else if (s.kind === "tx") req.transactions[name] = s.filter;
     }
+    if ([...this.subs.values()].some((s) => s.kind === "tx")) req.blocksMeta.bm = {};
     if (ping) req.ping = { id: 1 };
     return req;
   }
@@ -108,10 +119,27 @@ class CommitmentStream {
       if (u.slot.status !== SLOT_PROCESSED || slot <= this.lastSlot) return;
       this.lastSlot = slot;
       for (const name of u.filters ?? []) this.subs.get(name)?.cb({ slot, parent: u.slot.parent != null ? num(u.slot.parent) : slot - 1, root: this.root });
+    } else if (u.blockMeta) {
+      const slot = num(u.blockMeta.slot); const bt = u.blockMeta.blockTime?.timestamp;
+      if (bt == null) return;
+      this.blockTimes.set(slot, num(bt)); if (this.blockTimes.size > 512) this.blockTimes.delete(this.blockTimes.keys().next().value!);
+      const q = this.pending.get(slot); if (q) { this.pending.delete(slot); for (const p of q) this.emitTx(p.u, p.filters, num(bt)); }
     } else if (u.transaction) {
-      let j: any;
-      for (const name of u.filters ?? []) { const s = this.subs.get(name); if (s) s.cb((j ??= geyserTxToJson(u.transaction))); }
+      const slot = num(u.transaction.slot); const filters = u.filters ?? [];
+      const bt = this.blockTimes.get(slot);
+      if (bt != null || this.g.o.blockTimeWaitMs <= 0) return this.emitTx(u.transaction, filters, bt ?? null);
+      let q = this.pending.get(slot);
+      if (!q) {
+        q = []; this.pending.set(slot, q);
+        const t = setTimeout(() => { const qq = this.pending.get(slot); if (!qq) return; this.pending.delete(slot); for (const p of qq) this.emitTx(p.u, p.filters, null); }, this.g.o.blockTimeWaitMs); t.unref();
+      }
+      q.push({ u: u.transaction, filters });
     }
+  }
+  private emitTx(t: any, filters: string[], blockTime: number | null) {
+    const j = geyserTxToJson(t, blockTime);
+    this.g.record(j);
+    for (const name of filters) { const s = this.subs.get(name); if (s?.kind === "tx") s.cb(j); }
   }
   close() { this.closed = true; clearInterval(this.pingT); const s = this.stream; this.stream = undefined; s?.end?.(); s?.destroy?.(); }
 }
@@ -122,8 +150,18 @@ export class GeyserUpstream implements Upstream {
   private next = 1;
   private clientP?: Promise<GeyserClientLike>;
   stats = { subs: 0, fallbackSubs: 0 };
+  readonly recorder?: TxRecorder;
   constructor(opts: GeyserOptions) {
-    this.o = { log: () => {}, pingMs: 10_000, minBackoffMs: 200, maxBackoffMs: 10_000, ...opts };
+    this.o = { log: () => {}, pingMs: 10_000, minBackoffMs: 200, maxBackoffMs: 10_000, blockTimeWaitMs: Number(process.env.GEYSER_BLOCKTIME_WAIT_MS ?? 1500), recordAccounts: [], ...opts } as any;
+    this.recorder = opts.recorder ?? (process.env.GEYSER_RECORD ? new TxRecorder(process.env.GEYSER_RECORD) : undefined);
+    const ra = opts.recordAccounts ?? (process.env.GEYSER_RECORD_ACCOUNTS?.split(",").filter(Boolean) ?? []);
+    if (this.recorder && ra.length) this.subscribeTransactions({ accountInclude: ra, vote: false }, "confirmed", () => {});
+  }
+  /** called for every tx emitted by any stream (deduped by signature inside the recorder) */
+  record(j: any) {
+    if (!this.recorder) return;
+    const keys = [...j.transaction.message.accountKeys, ...j.meta.loadedAddresses.writable, ...j.meta.loadedAddresses.readonly];
+    try { this.recorder.record({ slot: j.slot, sig: j.transaction.signatures[0], keys, failed: !!j.meta.err, vote: !!j.isVote, tx: j }); } catch (e: any) { this.o.log("[geyser] record failed", e?.message); }
   }
   client(): Promise<GeyserClientLike> {
     return (this.clientP ??= (async () => {
@@ -162,5 +200,5 @@ export class GeyserUpstream implements Upstream {
       vote: f.vote === true ? undefined : false, failed: f.failed === false ? false : undefined,
       accountInclude: f.accountInclude ?? [], accountExclude: f.accountExclude ?? [], accountRequired: f.accountRequired ?? [] } });
   }
-  close() { for (const s of this.streams.values()) s.close(); this.streams.clear(); (this.o.fallback as any).close?.(); }
+  close() { this.recorder?.close(); for (const s of this.streams.values()) s.close(); this.streams.clear(); (this.o.fallback as any).close?.(); }
 }

@@ -24,11 +24,12 @@
   "type": "module",
   "dependencies": {
     "@noble/hashes": "^2.4.0",
+    "@triton-one/yellowstone-grpc": "^9.0.1",
     "msgpackr": "^2.1.2",
-    "ws": "^8.22.0",
-    "@triton-one/yellowstone-grpc": "^9.0.1"
+    "ws": "^8.22.0"
   },
   "devDependencies": {
+    "@grpc/grpc-js": "^1.14.6",
     "@types/node": "^26.6.5",
     "@types/ws": "^8.18.2",
     "tsx": "^4.23.15",

@@ -145,18 +145,23 @@ await unsub();
   - No server-side rebroadcast beyond upstream `maxRetries`.
   - Live checks only ever use `simulateTransaction` and the read-only `getTipAccounts`. Tests use mocks only.
 - **DAS without `DAS_RPC_URL`:**
-  - No off-chain JSON (`files`/`links` empty) and no price data.
-  - cNFTs are covered only for `CNFT_TREES` trees and the modelled instructions (see Compressed NFTs).
-  - `searchAssets`/`getAssetsByGroup` see only the local index: indexed cNFTs plus the queried owner's tokens. There is no global collection/creator index for uncompressed NFTs.
-  - `requestAirdrop` is not proxied.
-- **Geyser** is optional and bring-your-own (`GEYSER_URL`/`GEYSER_TOKEN`), and it is only verified against a fake stream in tests.
-  - Without it, streaming is bounded by standard WS pubsub latency, and `transactionSubscribe` costs one `getTransaction` per matching signature (100-account cap, logs-mention coverage, heuristic vote filter).
-  - With it, tx `meta.err` is passed through as raw bincode bytes (base64) rather than the decoded JSON error, and `blockTime` is `null`.
-  - LaserStream's 24h historical replay is not provided.
-- **Enhanced webhooks** parse only TRANSFER, SWAP (heuristic), minimal NFT_SALE and Bubblegum cNFT types. Helius classifies hundreds of types and sources and has richer `events`.
-  - Delivery is one POST per transaction (no batching).
-  - Restart backfill is bounded (newest 200 signatures per address), so a long outage on a busy address can drop transactions.
-- **Replay** is in memory by default. With `STREAM_PERSIST_DIR` it survives restarts within `STREAM_RETENTION_MS` and the ring size, but only for topics that were active. Helius replays about 24h (≈216k slots) for any filter.
+  - Off-chain JSON is opt-in (`DAS_FETCH_JSON=1`; `DAS_JSON_TIMEOUT_MS`, `DAS_JSON_MAX_BYTES`, `DAS_JSON_TTL_MS`, `DAS_JSON_CACHE`, `DAS_JSON_CONCURRENCY`, `DAS_IPFS_GATEWAY`, `DAS_ARWEAVE_GATEWAY`). Private IPs are blocked unless `DAS_JSON_ALLOW_PRIVATE=1`. There is no CDN or image cache and no price data.
+  - The collection index covers only the collections listed in `DAS_COLLECTIONS` (gPA on Token Metadata, refreshed every `DAS_COLLECTIONS_REFRESH_MS`, `DAS_COLLECTION_MAX_CREATORS`). Its offsets assume padded name/symbol/uri strings, so metadata with unpadded strings can be missed. There is no global creator index.
+  - cNFTs are indexed only for `CNFT_TREES` trees. `requestAirdrop` is not proxied.
+- **Bubblegum:** all V1 and V2 instructions are recognised. When noop events are present (both noop programs), state comes from the real changelog `seq`/leaf index, non-sequential mints are handled, and `seqGaps` is counted. `syncTree` reads the on-chain seq and `num_minted`.
+  - Metadata-changing V2 ops (collection/creator/data) are best effort, because the leaf only carries hashes.
+  - The fallback path without events assumes sequential nonces.
+  - There is no proof backfill from history. A tree's history before indexing starts is unknown.
+- **Geyser** is optional and bring-your-own (`GEYSER_URL`/`GEYSER_TOKEN`). It is tested against a real gRPC mock server through the yellowstone client.
+  - `meta.err` is decoded to JSON. `blockTime` comes from blocksMeta (txs wait up to `GEYSER_BLOCKTIME_WAIT_MS`, default 1500, then fall back to `null`).
+  - Replay: `GEYSER_RECORD=<dir>` keeps hourly JSONL for 24h, and `transactionSubscribe` accepts `fromSlot`. Only txs matching active subscriptions or `GEYSER_RECORD_ACCOUNTS` are recorded, unlike LaserStream's full-chain replay.
+  - Without Geyser, streaming is bounded by WS pubsub latency, and `transactionSubscribe` costs one `getTransaction` per signature.
+- **Enhanced webhooks:**
+  - Supported types: TRANSFER, SWAP, TOKEN_MINT, BURN, STAKE_SOL/UNSTAKE_SOL/WITHDRAW, CREATE_ACCOUNT, NFT_SALE/LISTING/CANCEL_LISTING/BID/BID_CANCELLED and all COMPRESSED_NFT_* types.
+  - Swaps decode Jupiter `SwapEvent`/`SwapsEvent` plus Raydium/Orca hop transfers. Marketplace parsing covers only Magic Eden and Tensor. Helius covers far more types and sources.
+  - Delivery is batched (`WEBHOOK_BATCH_MAX`, default 100; `WEBHOOK_FLUSH_MS`).
+  - Restart backfill paginates with `before`, up to `WEBHOOK_BACKFILL_MAX` (default 5000) signatures per address.
+- **Replay** for WS/SSE topics is in memory, or on disk with `STREAM_PERSIST_DIR`, only for topics that were active.
 - **Priority fee** is a heuristic. For v0 transactions only static keys are decoded (lookup-table keys aren't resolved).
 - **gPA limits**: results above `GPA_MAX_RESULTS` return `-32005`. There is no `getProgramAccountsV2` pagination. The public mainnet RPC also blocks gPA for large programs (`403`, passed through).
 - **Limits/credits** are per process and in memory. Nothing is shared across instances and nothing is billed.

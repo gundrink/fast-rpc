@@ -11,8 +11,10 @@ export interface Webhook { webhookID: string; wallet: string; webhookURL: string
 export interface WebhookOptions {
   /** JSON-RPC caller used for restart backfill (getSignaturesForAddress + getTransaction) */
   rpc?: (method: string, params: any[]) => Promise<any>;
-  /** max signatures per address fetched on restart backfill (default 200) */
+  /** max signatures per address fetched on restart backfill, paginated with `before` (default 5000, WEBHOOK_BACKFILL_MAX) */
   backfillLimit?: number;
+  /** batching: max txs per POST (default 100, WEBHOOK_BATCH_MAX) and flush delay (default 0 = next tick, WEBHOOK_FLUSH_MS) */
+  maxBatch?: number; flushMs?: number;
   file?: string; maxRetries?: number; baseDelayMs?: number; timeoutMs?: number; maxPerKey?: number; log?: (...a: any[]) => void }
 
 export class WebhookError extends Error { constructor(public status: number, msg: string) { super(msg); } }
@@ -27,10 +29,12 @@ export class WebhookManager {
   /** resolves when restart backfill is done */
   ready: Promise<void> = Promise.resolve();
   private pending = new Set<Promise<void>>();
+  private batches = new Map<string, { items: any[]; t?: NodeJS.Timeout }>();
 
   constructor(private hub: StreamHub, private getTx: GetTx, opts: WebhookOptions = {}) {
     this.o = { file: opts.file ?? process.env.WEBHOOKS_FILE, maxRetries: opts.maxRetries ?? 5, baseDelayMs: opts.baseDelayMs ?? 1000,
-      timeoutMs: opts.timeoutMs ?? 10_000, maxPerKey: opts.maxPerKey ?? 50, log: opts.log ?? (() => {}), rpc: opts.rpc, backfillLimit: opts.backfillLimit ?? 200 };
+      timeoutMs: opts.timeoutMs ?? 10_000, maxPerKey: opts.maxPerKey ?? 50, log: opts.log ?? (() => {}), rpc: opts.rpc,
+      backfillLimit: opts.backfillLimit ?? Number(process.env.WEBHOOK_BACKFILL_MAX ?? 5000), maxBatch: opts.maxBatch ?? Number(process.env.WEBHOOK_BATCH_MAX ?? 100), flushMs: opts.flushMs ?? Number(process.env.WEBHOOK_FLUSH_MS ?? 0) };
     if (this.o.file && fs.existsSync(this.o.file)) {
       try {
         for (const h of JSON.parse(fs.readFileSync(this.o.file, "utf8")) as Webhook[]) this.hooks.set(h.webhookID, h);
@@ -61,8 +65,19 @@ export class WebhookManager {
     if (!rpc || !from) return;
     const sigs = new Map<string, number>();
     for (const a of h.accountAddresses) {
-      const page: any[] = await rpc("getSignaturesForAddress", [a, { limit: Math.min(1000, this.o.backfillLimit), commitment: "confirmed" }]);
-      for (const s of page ?? []) if (s.slot > from && !(h.txnStatus === "success" && s.err) && !(h.txnStatus === "failed" && !s.err)) sigs.set(s.signature, s.slot);
+      let before: string | undefined; let got = 0;
+      while (got < this.o.backfillLimit) {
+        const limit = Math.min(1000, this.o.backfillLimit - got);
+        const page: any[] = await rpc("getSignaturesForAddress", [a, { limit, commitment: "confirmed", ...(before ? { before } : {}) }]);
+        if (!page?.length) break;
+        got += page.length; let reached = false;
+        for (const s of page) {
+          if (s.slot <= from) { reached = true; continue; }
+          if (!(h.txnStatus === "success" && s.err) && !(h.txnStatus === "failed" && !s.err)) sigs.set(s.signature, s.slot);
+        }
+        if (reached || page.length < limit) break;
+        before = page.at(-1).signature;
+      }
     }
     const ordered = [...sigs].sort((x, y) => x[1] - y[1]);
     let n = 0;
@@ -89,8 +104,22 @@ export class WebhookManager {
       if (enhanced) payload = e;
     }
     const s = this.st(h.webhookID); s.lastSlot = Math.max(s.lastSlot ?? 0, tx.slot ?? 0); this.saveState();
-    const p = this.deliver(h, [payload]); this.pending.add(p); p.finally(() => this.pending.delete(p));
+    this.enqueue(h, payload);
     return true;
+  }
+  private enqueue(h: Webhook, payload: any) {
+    let b = this.batches.get(h.webhookID); if (!b) { b = { items: [] }; this.batches.set(h.webhookID, b); }
+    b.items.push(payload);
+    if (b.items.length >= this.o.maxBatch) return this.flush(h);
+    if (!b.t) { b.t = setTimeout(() => this.flush(h), this.o.flushMs); }
+  }
+  private flush(h: Webhook) {
+    const b = this.batches.get(h.webhookID); if (!b) return;
+    if (b.t) { clearTimeout(b.t); b.t = undefined; }
+    while (b.items.length) {
+      const items = b.items.splice(0, this.o.maxBatch);
+      const p = this.deliver(h, items); this.pending.add(p); p.finally(() => this.pending.delete(p));
+    }
   }
 
   private save() {
@@ -162,14 +191,14 @@ export class WebhookManager {
         const r = await fetch(h.webhookURL, { method: "POST", body, signal: AbortSignal.timeout(this.o.timeoutMs),
           headers: { "content-type": "application/json", ...(h.authHeader ? { authorization: h.authHeader } : {}) } });
         await r.arrayBuffer().catch(() => {});
-        if (r.ok) { st.delivered++; this.saveState(); return; }
+        if (r.ok) { st.delivered += payload.length; (st as any).posts = ((st as any).posts ?? 0) + 1; this.saveState(); return; }
         st.lastError = `HTTP ${r.status}`;
         if (r.status >= 400 && r.status < 500 && r.status !== 408 && r.status !== 429) break; // permanent
       } catch (e: any) { st.lastError = e?.message ?? String(e); }
       if (attempt < this.o.maxRetries) { st.retries++; await new Promise((res) => setTimeout(res, this.o.baseDelayMs * 2 ** attempt)); }
     }
-    st.failed++; this.saveState(); this.o.log(`[webhooks] delivery failed ${h.webhookID}: ${st.lastError}`);
+    st.failed += payload.length; this.saveState(); this.o.log(`[webhooks] delivery failed ${h.webhookID}: ${st.lastError}`);
   }
-  async idle() { await Promise.all([...this.pending]); }
-  close() { for (const id of [...this.watchers.keys()]) this.stop(id); if (this.stateT) { clearTimeout(this.stateT); this.stateT = undefined; this.writeState(); } }
+  async idle() { for (const id of this.batches.keys()) { const h = this.hooks.get(id); if (h) this.flush(h); } await Promise.all([...this.pending]); }
+  close() { for (const b of this.batches.values()) if (b.t) clearTimeout(b.t); for (const id of [...this.watchers.keys()]) this.stop(id); if (this.stateT) { clearTimeout(this.stateT); this.stateT = undefined; this.writeState(); } }
 }

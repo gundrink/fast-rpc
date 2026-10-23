@@ -5,7 +5,7 @@ import { decodeTransaction, isPubkey } from "./codec.js";
 
 export const VOTE_PROGRAM = "Vote111111111111111111111111111111111111111";
 export interface TxFilter { accountInclude?: string[]; accountExclude?: string[]; accountRequired?: string[]; vote?: boolean; failed?: boolean; signature?: string }
-export interface TxOptions { commitment?: "processed" | "confirmed" | "finalized"; encoding?: "json" | "jsonParsed" | "base64" | "base58"; transactionDetails?: "full" | "signatures" | "accounts" | "none"; showRewards?: boolean; maxSupportedTransactionVersion?: number }
+export interface TxOptions { commitment?: "processed" | "confirmed" | "finalized"; encoding?: "json" | "jsonParsed" | "base64" | "base58"; transactionDetails?: "full" | "signatures" | "accounts" | "none"; showRewards?: boolean; maxSupportedTransactionVersion?: number; /** replay recorded txs (Geyser recorder, <=24h) from this slot before going live */ fromSlot?: number }
 export type GetTx = (sig: string, cfg: any) => Promise<any>;
 export const MAX_FILTER_ACCOUNTS = Number(process.env.TX_FILTER_MAX_ACCOUNTS ?? 100);
 
@@ -60,7 +60,10 @@ export class TxWatcher {
     if (nativeTx(hub)) {
       // Geyser path: the node filters and ships full transactions; no getTransaction round trip
       const un = (hub.upstream as any).subscribeTransactions(filter, opts.commitment ?? hub.chain.defaultCommitment, (r: any) => this.onNative(r));
-      this.detach.push(un); return;
+      this.detach.push(un);
+      const rec = (hub.upstream as any).recorder;
+      if (opts.fromSlot != null && rec) void this.replay(rec, opts.fromSlot);
+      return;
     }
     const watch = new Set([...(filter.accountInclude ?? []), ...(filter.accountRequired ?? [])]);
     for (const a of watch) {
@@ -76,6 +79,17 @@ export class TxWatcher {
     this.stats.matched++;
     const { isVote, ...tx } = r;
     try { this.onTx({ signature: sig, slot: r.slot, tx }); } catch {}
+  }
+  private async replay(rec: any, fromSlot: number) {
+    for await (const r of rec.replay(fromSlot)) {
+      if (this.stopped) return;
+      if (this.seen.has(r.sig)) continue;
+      if ((r.vote && this.filter.vote !== true) || !matchesFilter(this.filter, r.keys, r.failed)) continue;
+      this.seen.add(r.sig); this.seenQ.push(r.sig);
+      this.stats.matched++;
+      const { isVote, ...tx } = r.tx;
+      try { this.onTx({ signature: r.sig, slot: r.slot, tx }); } catch {}
+    }
   }
   private onLog(e: Entry) {
     const v = e.data; const sig = v?.signature;

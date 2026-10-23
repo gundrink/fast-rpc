@@ -1,6 +1,8 @@
 // DAS (Digital Asset Standard) API. Proxies to DAS_RPC_URL when set; otherwise best-effort on-chain
 // implementation of getAsset / getAssetsByOwner for SPL mints (+ Metaplex Token Metadata decoding).
 import type { CnftIndexer, CnftAsset } from "./bubblegum.js";
+import { JsonFetcher } from "./offchain.js";
+import { CollectionIndex } from "./collections.js";
 import { RpcError, INVALID_PARAMS } from "./errors.js";
 import { b58decode, b58encode, findProgramAddress, isPubkey } from "./codec.js";
 
@@ -64,12 +66,23 @@ function toAsset(mint: string, mintInfo: any, tokenProgram: string, md0?: Metada
   };
 }
 
-export function createDas(up: Up, dasUp?: Up, cnft?: CnftIndexer) {
+export interface DasExtras { json?: JsonFetcher | false; collections?: CollectionIndex }
+export function createDas(up: Up, dasUp?: Up, cnft?: CnftIndexer, extras: DasExtras = {}) {
   const proxied = Object.fromEntries(DAS_METHODS.map((m) => [m, (p: any) => {
     if (!dasUp) throw new RpcError(-32601, `${m} requires DAS_RPC_URL (no on-chain fallback for this method)`);
     return dasUp(m, p ?? {}, 0);
   }]));
   if (dasUp) return proxied;
+  // off-chain json: on when DAS_FETCH_JSON=1 (or a fetcher is injected); per request displayOptions.showContent=false skips it
+  const json = extras.json === false ? undefined : extras.json ?? (process.env.DAS_FETCH_JSON === "1" ? new JsonFetcher() : undefined);
+  const collections = extras.collections ?? (process.env.DAS_COLLECTIONS ? new CollectionIndex() : undefined);
+  if (collections?.enabled && !extras.collections) collections.start(up);
+  const enrich = async <T>(x: T, p?: any): Promise<T> => {
+    if (!json || p?.displayOptions?.showContent === false) return x;
+    const list = (Array.isArray(x) ? x : (x as any)?.items ?? [x]).filter(Boolean);
+    await Promise.all(list.map((a: any) => json.enrich(a)));
+    return x;
+  };
 
   const fetchAssets = async (mints: string[], owners: Map<string, { owner: string; frozen: boolean; amount?: string }> = new Map()) => {
     const out: any[] = [];
@@ -120,8 +133,14 @@ export function createDas(up: Up, dasUp?: Up, cnft?: CnftIndexer) {
     },
     getAssetsByGroup: async (p: any) => {
       if (p?.groupKey !== "collection" || !isPubkey(p?.groupValue)) throw INVALID_PARAMS("getAssetsByGroup: groupKey must be 'collection' and groupValue a collection mint");
-      // local index only: compressed assets from CNFT_TREES (uncompressed collection members need a DAS indexer)
-      return page(cnftOf((a) => a.metadata.collection?.verified === true && a.metadata.collection.key === p.groupValue), p);
+      // local indexes: compressed assets (CNFT_TREES) + uncompressed members of DAS_COLLECTIONS (gPA index)
+      const c = cnftOf((a) => a.metadata.collection?.verified === true && a.metadata.collection.key === p.groupValue);
+      const mints = collections?.has(p.groupValue) ? collections.list(p.groupValue) : [];
+      const { limit, page: pg } = paging(p); const start = (pg - 1) * limit;
+      const cs = c.slice(start, start + limit);
+      const ms = mints.slice(Math.max(0, start - c.length), Math.max(0, start - c.length) + (limit - cs.length));
+      const items = [...cs, ...(ms.length ? (await fetchAssets(ms)).filter(Boolean) : [])];
+      return enrich({ total: c.length + mints.length, limit, page: pg, items }, p);
     },
     searchAssets: async (p: any = {}) => {
       const known = new Set(["ownerAddress", "grouping", "creatorAddress", "creatorVerified", "compressed", "burnt", "tokenType", "page", "limit", "sortBy", "displayOptions", "options", "interface"]);
@@ -144,15 +163,15 @@ export function createDas(up: Up, dasUp?: Up, cnft?: CnftIndexer) {
         if (tt === "nonFungible" || tt === "regularNft") toks = toks.filter((a) => a.interface !== "FungibleToken");
         items = [...items, ...toks];
       }
-      return page(items, p);
+      return enrich(page(items, p), p);
     },
     getAsset: async (p: any) => {
       const id = p?.id;
       if (!isPubkey(id)) throw INVALID_PARAMS("getAsset: params.id must be a mint address");
-      if (cnft?.has(id)) return cnft.toDas(cnft.assets.get(id)!);
+      if (cnft?.has(id)) return enrich(cnft.toDas(cnft.assets.get(id)!), p);
       const [a] = await fetchAssets([id]);
       if (!a) throw new RpcError(-32000, "Asset not found (on-chain fallback supports SPL mints only)");
-      return a;
+      return enrich(a, p);
     },
     getAssetBatch: async (p: any) => {
       const ids: string[] = p?.ids;
@@ -160,7 +179,7 @@ export function createDas(up: Up, dasUp?: Up, cnft?: CnftIndexer) {
       const local = new Map(ids.filter((i) => cnft?.has(i)).map((i) => [i, cnft!.toDas(cnft!.assets.get(i)!)]));
       const rest = ids.filter((i) => !local.has(i)); const fetched = rest.length ? await fetchAssets(rest) : [];
       const m = new Map(rest.map((i, j) => [i, fetched[j]]));
-      return ids.map((i) => local.get(i) ?? m.get(i) ?? null);
+      return enrich(ids.map((i) => local.get(i) ?? m.get(i) ?? null), p);
     },
     getAssetsByOwner: async (p: any) => {
       const owner = p?.ownerAddress;
@@ -173,7 +192,7 @@ export function createDas(up: Up, dasUp?: Up, cnft?: CnftIndexer) {
       const c = compressed.slice(start, start + limit);
       const pageMints = all.slice(Math.max(0, start - compressed.length), Math.max(0, start - compressed.length) + (limit - c.length));
       const items = [...c, ...(await fetchAssets(pageMints, owners)).filter(Boolean)];
-      return { total: all.length + compressed.length, limit, page, items };
+      return enrich({ total: all.length + compressed.length, limit, page, items }, p);
     },
   };
 }

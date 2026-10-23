@@ -7,11 +7,12 @@
     "example": "examples"
   },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "node --import tsx --test --test-concurrency=1 test/*.test.ts",
     "demo": "tsx examples/demo.ts",
     "serve": "tsx examples/serve.ts",
     "stream": "tsx examples/stream.ts",
-    "typecheck": "tsc --noEmit --types node --target es2022 --module nodenext --moduleResolution nodenext --strict --skipLibCheck src/*.ts examples/*.ts"
+    "typecheck": "tsc --noEmit --types node --target es2022 --module nodenext --moduleResolution nodenext --strict --skipLibCheck src/*.ts examples/*.ts test/*.ts",
+    "live": "tsx examples/live-check.ts"
   },
   "keywords": [],
   "author": "",

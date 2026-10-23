@@ -1,4 +1,4 @@
-import { RpcServer, RpcClient, solanaApi, SolanaApi } from "../src/index.js";
+import { RpcServer, RpcClient, solanaApi, type SolanaApi } from "../src/index.js";
 const port = Number(process.env.PORT ?? 7070);
 let server: RpcServer | undefined;
 if (!process.env.NO_SERVER) {

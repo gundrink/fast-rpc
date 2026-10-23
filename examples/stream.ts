@@ -59,6 +59,6 @@ console.log(ts(), `D asked fromSlot=${from}, got ${dSlots.length} replayed immed
 
 await unsubB();
 for (const x of [a, b, c, d]) x.close();
-server.close();
+await server.close(); hub.close();
 setTimeout(() => process.exit(0), 200);
 void after;

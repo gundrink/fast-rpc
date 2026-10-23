@@ -153,10 +153,14 @@ test("DAS fallback: getAssetsByOwner (hides zero balances, paging, ownership)", 
 });
 
 test("DAS: methods w/o fallback need DAS_RPC_URL; DAS_RPC_URL proxies everything", async () => {
-  for (const m of ["getAssetProof", "getAssetsByGroup", "searchAssets", "getSignaturesForAsset"]) {
+  for (const m of ["getSignaturesForAsset", "getAssetsByCreator"]) {
     const r = await rpc(m, { id: A });
     assert.equal(r.error.code, -32601); assert.match(r.error.message, /DAS_RPC_URL/);
   }
+  // now served from the local index (empty here): proof not found, bad group params rejected
+  assert.equal((await rpc("getAssetProof", { id: A })).error.code, -32000);
+  assert.equal((await rpc("getAssetsByGroup", { groupKey: "creator", groupValue: A })).error.code, -32602);
+  assert.equal((await rpc("searchAssets", { id: A })).error.code, -32602);
   const das = createFastRpc({ api: { url: mock.httpUrl, dasUrl: dasMock.httpUrl }, hub: { wsUrl: mock.wsUrl }, webhooks: false });
   const p = await das.server.listen(0);
   try {
@@ -237,7 +241,7 @@ test("webhooks REST: create/list/get/update/delete + validation + persistence", 
   try {
     assert.equal((await rest("POST", "/v0/webhooks", { webhookURL: "ftp://x", accountAddresses: [A] })).status, 400);
     assert.equal((await rest("POST", "/v0/webhooks", { webhookURL: rv.url, accountAddresses: [] })).status, 400);
-    assert.equal((await rest("POST", "/v0/webhooks", { webhookURL: rv.url, accountAddresses: [A], webhookType: "enhanced" })).status, 400);
+    assert.equal((await rest("POST", "/v0/webhooks", { webhookURL: rv.url, accountAddresses: [A], webhookType: "bogus" })).status, 400);
     const c = await rest("POST", "/v0/webhooks", { webhookURL: rv.url, accountAddresses: [B, B], transactionTypes: ["ANY"], webhookType: "raw" });
     assert.equal(c.status, 200);
     const id = c.json.webhookID;

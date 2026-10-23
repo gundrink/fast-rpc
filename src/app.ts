@@ -3,9 +3,12 @@ import { StreamHub, type HubOptions } from "./stream.js";
 import { createSolanaApi, createUpstream, upstreamUrl, type SolanaApiOptions } from "./solana.js";
 import { WebhookManager, type WebhookOptions } from "./webhooks.js";
 import { ChainState, type ChainOptions } from "./chain.js";
+import { CnftIndexer, type IndexerOptions } from "./bubblegum.js";
 
 export interface FastRpcOptions {
   server?: ServerOptions; hub?: HubOptions; api?: SolanaApiOptions; webhooks?: WebhookOptions | false;
+  /** compressed-NFT indexer (CNFT_TREES); backfill from creation when CNFT_BACKFILL=1 */
+  cnft?: IndexerOptions & { backfill?: boolean };
   chain?: ChainOptions & {
     /** call getAgGenesisCert at start + every redetectMs (default true; CHAIN_DETECT=0 disables) */
     detect?: boolean; redetectMs?: number;
@@ -19,9 +22,16 @@ export function createFastRpc(opts: FastRpcOptions = {}) {
   const co = opts.chain ?? {};
   const chain = new ChainState(co);
   const hub = new StreamHub({ ...opts.hub, chain });
-  const api = createSolanaApi({ ...opts.api, chain }) as Record<string, (...a: any[]) => any>;
+  const cnft = new CnftIndexer(opts.cnft);
+  const api = createSolanaApi({ ...opts.api, chain, cnft }) as Record<string, (...a: any[]) => any>;
   const getTx = (sig: string, cfg: any) => api.getTransaction(sig, cfg);
-  const webhooks = opts.webhooks === false ? undefined : new WebhookManager(hub, getTx, opts.webhooks);
+  const rpc = (m: string, p: any[]) => api[m](...p);
+  const webhooks = opts.webhooks === false ? undefined : new WebhookManager(hub, getTx, { rpc, ...opts.webhooks });
+  if (cnft.enabled) {
+    cnft.start(hub, getTx);
+    if (opts.cnft?.backfill ?? process.env.CNFT_BACKFILL === "1")
+      for (const [tree, t] of cnft.trees) if (t.seq === 0) void cnft.backfill(rpc, tree).catch((e) => opts.cnft?.log?.("[cnft] backfill failed", tree, e?.message));
+  }
   const server = new RpcServer(opts.server).attachStreams(hub, getTx).registerAll(api).attachChain(chain);
   if (webhooks) server.attachWebhooks(webhooks);
   const timers: NodeJS.Timeout[] = [];
@@ -31,7 +41,7 @@ export function createFastRpc(opts: FastRpcOptions = {}) {
   if (detect) { const t = setInterval(() => void chain.detect(detectUp), co.redetectMs ?? 600_000); t.unref(); timers.push(t); }
   const track = (co.trackSlots ?? process.env.CHAIN_TRACK_SLOTS === "1") ? hub.subscribe("slot", {}, { deliver: () => {} }) : undefined;
   return {
-    server, hub, api, webhooks, chain, ready,
-    close: async () => { for (const t of timers) clearInterval(t); track?.detach(); webhooks?.close(); await server.close(); hub.close(); },
+    server, hub, api, webhooks, chain, cnft, ready,
+    close: async () => { for (const t of timers) clearInterval(t); track?.detach(); webhooks?.close(); cnft.stop(); await server.close(); hub.close(); },
   };
 }

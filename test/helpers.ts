@@ -25,7 +25,7 @@ export async function startMockSolana() {
   const server = http.createServer((req, res) => {
     let b = ""; req.on("data", (c) => (b += c));
     req.on("end", () => {
-      const r = JSON.parse(b); calls.push({ method: r.method, params: r.params });
+      const r = JSON.parse(b); calls.push({ method: r.method, params: r.params, path: req.url } as any);
       const f = responses[r.method];
       let out: any;
       try { out = f ? { jsonrpc: "2.0", id: r.id, result: f(r.params) } : { jsonrpc: "2.0", id: r.id, error: { code: -32601, message: "Method not found" } }; }

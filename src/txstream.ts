@@ -9,7 +9,11 @@ export interface TxOptions { commitment?: "processed" | "confirmed" | "finalized
 export type GetTx = (sig: string, cfg: any) => Promise<any>;
 export const MAX_FILTER_ACCOUNTS = Number(process.env.TX_FILTER_MAX_ACCOUNTS ?? 100);
 
-export function validateTxFilter(f: any): TxFilter {
+export const MAX_FILTER_ACCOUNTS_GEYSER = Number(process.env.TX_FILTER_MAX_ACCOUNTS_GEYSER ?? 50_000);
+/** true when the hub's upstream can stream transactions natively (Yellowstone gRPC) */
+export const nativeTx = (hub: StreamHub) => typeof (hub.upstream as any)?.subscribeTransactions === "function";
+
+export function validateTxFilter(f: any, max = MAX_FILTER_ACCOUNTS): TxFilter {
   if (f == null || typeof f !== "object" || Array.isArray(f)) throw INVALID_PARAMS("transactionSubscribe: params[0] must be a filter object");
   for (const k of ["accountInclude", "accountExclude", "accountRequired"] as const) {
     if (f[k] === undefined) continue;
@@ -17,7 +21,7 @@ export function validateTxFilter(f: any): TxFilter {
   }
   const watch = new Set([...(f.accountInclude ?? []), ...(f.accountRequired ?? [])]);
   if (!watch.size) throw INVALID_PARAMS("transactionSubscribe: accountInclude or accountRequired must be non-empty (logs-based backend)");
-  if (watch.size > MAX_FILTER_ACCOUNTS) throw INVALID_PARAMS(`transactionSubscribe: max ${MAX_FILTER_ACCOUNTS} accounts`);
+  if (watch.size > max) throw INVALID_PARAMS(`transactionSubscribe: max ${max} accounts`);
   return f;
 }
 
@@ -53,11 +57,25 @@ export class TxWatcher {
   stats = { matched: 0, filtered: 0, fetchFailed: 0, dropped: 0 };
   constructor(private hub: StreamHub, private getTx: GetTx, private filter: TxFilter, private opts: TxOptions, private onTx: (e: TxEvent) => void,
     private cfg: { concurrency: number; maxQueue: number; retries: number; retryMs?: number } = { concurrency: 8, maxQueue: 2000, retries: 4 }) {
+    if (nativeTx(hub)) {
+      // Geyser path: the node filters and ships full transactions; no getTransaction round trip
+      const un = (hub.upstream as any).subscribeTransactions(filter, opts.commitment ?? hub.chain.defaultCommitment, (r: any) => this.onNative(r));
+      this.detach.push(un); return;
+    }
     const watch = new Set([...(filter.accountInclude ?? []), ...(filter.accountRequired ?? [])]);
     for (const a of watch) {
       const r = hub.subscribe("logs", { mentions: a, commitment: opts.commitment ?? hub.chain.defaultCommitment }, { deliver: (e: Entry) => this.onLog(e) });
       this.detach.push(r.detach);
     }
+  }
+  private onNative(r: any) {
+    if (this.stopped) return;
+    const sig = r?.transaction?.signatures?.[0]; if (!sig || this.seen.has(sig)) return;
+    this.seen.add(sig); this.seenQ.push(sig); if (this.seenQ.length > 20_000) this.seen.delete(this.seenQ.shift()!);
+    if ((r.isVote && this.filter.vote !== true) || !matchesFilter(this.filter, txAccountKeys(r), !!r.meta?.err)) { this.stats.filtered++; return; }
+    this.stats.matched++;
+    const { isVote, ...tx } = r;
+    try { this.onTx({ signature: sig, slot: r.slot, tx }); } catch {}
   }
   private onLog(e: Entry) {
     const v = e.data; const sig = v?.signature;

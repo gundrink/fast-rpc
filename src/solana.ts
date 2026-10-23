@@ -3,6 +3,7 @@ import { RpcError, INVALID_PARAMS } from "./errors.js";
 import { decodeTransaction } from "./codec.js";
 import { createDas } from "./das.js";
 import { ChainState } from "./chain.js";
+import { createJito, type JitoOptions } from "./jito.js";
 
 export const upstreamUrl = process.env.SOLANA_RPC_URL ?? "https://api.mainnet-beta.solana.com";
 export interface SolanaApiOptions {
@@ -13,6 +14,10 @@ export interface SolanaApiOptions {
   dasUrl?: string;
   /** slot-rate / consensus state (Alpenglow-aware TTLs and commitment). */
   chain?: ChainState;
+  /** Jito block engine (JITO_URL). Dual send: sendTransaction cfg {jito:true} or SEND_JITO=1 */
+  jito?: JitoOptions; jitoDualSend?: boolean;
+  /** local compressed-NFT index (used when DAS_RPC_URL is unset) */
+  cnft?: import("./bubblegum.js").CnftIndexer;
 }
 
 export function createUpstream(url = upstreamUrl, timeoutMs = Number(process.env.SOLANA_TIMEOUT_MS ?? 10_000)) {
@@ -60,7 +65,7 @@ export function createSolanaApi(opts: SolanaApiOptions = {}) {
   const sendUrls = opts.sendUrls ?? (process.env.SEND_RPC_URLS ? process.env.SEND_RPC_URLS.split(",").map((x) => x.trim()).filter(Boolean) : []);
   const senders = [up, ...sendUrls.map((u) => createUpstream(u, opts.timeoutMs))];
   const dasUrl = opts.dasUrl ?? process.env.DAS_RPC_URL;
-  const das = createDas(up, dasUrl ? createUpstream(dasUrl, opts.timeoutMs) : undefined);
+  const das = createDas(up, dasUrl ? createUpstream(dasUrl, opts.timeoutMs) : undefined, opts.cnft);
   const checkTx = (m: string, a: any[]) => {
     if (typeof a[0] !== "string") throw INVALID_PARAMS(`${m}: params[0] must be a serialized transaction string`);
     const enc = a[1]?.encoding ?? "base58";
@@ -82,13 +87,26 @@ export function createSolanaApi(opts: SolanaApiOptions = {}) {
   const pass = (method: string, ttl: number | (() => number) = 0, check?: (a: any[]) => void) => (...a: any[]) => { const p = clean(a); check?.(p); return up(method, p, typeof ttl === "function" ? ttl() : ttl); };
   const needKey = (m: string) => (a: any[]) => { if (typeof a[0] !== "string" || !a[0]) throw INVALID_PARAMS(`${m}: params[0] must be a base58 string`); };
 
+  const jito = createJito(opts.jito);
+  const dual = opts.jitoDualSend ?? process.env.SEND_JITO === "1";
   const api = {
     ...das,
+    sendBundle: (...a: any[]) => jito.sendBundle(a[0], a[1]),
+    getBundleStatuses: (...a: any[]) => jito.getBundleStatuses(a[0]),
+    getInflightBundleStatuses: (...a: any[]) => jito.getInflightBundleStatuses(a[0]),
+    getTipAccounts: () => jito.getTipAccounts(),
     /** Relay a user-signed tx (no key custody). Fans out to all send upstreams, first success wins. */
     sendTransaction: async (...a: any[]) => {
-      const p = clean(a); const tx = checkTx("sendTransaction", p);
+      const p = clean(a);
+      const useJito = p[1]?.jito ?? dual;
+      if (p[1] && "jito" in p[1]) { const { jito: _j, ...rest } = p[1]; p[1] = rest; }
+      const tx = checkTx("sendTransaction", p);
       if (tx.numRequiredSignatures < 1) throw INVALID_PARAMS("sendTransaction: transaction has no signers");
-      const results = senders.map((s) => s("sendTransaction", p, 0));
+      // Sender-style dual path: Jito (tip required, validated before anything leaves) + RPC with skipPreflight
+      if (useJito && p[1]?.skipPreflight !== true) throw INVALID_PARAMS("sendTransaction: jito dual send requires skipPreflight: true");
+      if (useJito) await jito.checkTip(p[0], p[1]); // invalid/missing tip -> reject before anything is sent
+      const viaJito = useJito ? [jito.sendTransaction(p[0], p[1])] : [];
+      const results = [...viaJito, ...senders.map((s) => s("sendTransaction", p, 0))];
       try { return await Promise.any(results); }
       catch (e: any) { throw e.errors?.[0] ?? e; }
     },

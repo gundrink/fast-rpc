@@ -49,23 +49,58 @@ Upstream access is **read-only** (whitelisted methods) except the **send relay**
 ### Send relay (Sender-like)
 `sendTransaction` / `simulateTransaction` accept the standard Solana params (`[tx, {encoding, skipPreflight, preflightCommitment, maxRetries, minContextSlot, sigVerify, replaceRecentBlockhash}]`). The tx is **decoded locally first** (legacy + v0, base58/base64, ≤1232 bytes, ≥1 signer). Malformed input gets `-32602` and never reaches upstream. `sendTransaction` is fanned out in parallel to `SOLANA_RPC_URL` + every URL in `SEND_RPC_URLS` (comma list), and the first success (the signature) wins. If every upstream fails, the first upstream error is returned. `simulateTransaction` goes only to the primary.
 
+### Jito relay + Sender-style dual send
+- `sendBundle`, `getBundleStatuses`, `getInflightBundleStatuses` and `getTipAccounts` go to `JITO_URL` (default `https://mainnet.block-engine.jito.wtf`, `/api/v1/bundles`; optional `JITO_UUID`). `getTipAccounts` is cached for 10 minutes.
+- `sendBundle` takes 1..5 signed txs (base58/base64). Each is decoded locally. The bundle is rejected with `-32602` **before anything is sent** unless the txs together carry ≥ `JITO_MIN_TIP_LAMPORTS` (default 1000). A tip is a top-level System transfer to a `getTipAccounts` address held as a static key.
+- **Dual send:** `sendTransaction(tx, {skipPreflight:true, jito:true})`, or `SEND_JITO=1` for every send. It validates the tip, then races Jito `/api/v1/transactions` against the RPC fan-out (`SOLANA_RPC_URL` + `SEND_RPC_URLS`). The first signature wins. The `jito` flag is stripped before forwarding, and `skipPreflight:true` is required (as with Helius Sender).
+- No key custody: only user-signed bytes are forwarded. Tests use mock block engines only. The only live check is the read-only `npm run live:jito` (`getTipAccounts`).
+
+### Yellowstone gRPC upstream (optional)
+Set `GEYSER_URL` (+ `GEYSER_TOKEN`) to use `@triton-one/yellowstone-grpc` as the stream source.
+- `slotSubscribe`, `accountSubscribe` and `programSubscribe` (base64, memcmp/dataSize filters) become Geyser filters on one gRPC stream per commitment. The full filter set is rewritten on each change, re-sent on reconnect (exponential backoff), and pinged every 10s. Updates are converted to the exact Solana WS notification shapes.
+- `transactionSubscribe` (and webhooks / the cNFT indexer) use native Geyser transaction filters (`accountInclude/Exclude/Required`, `vote`, `failed`). Full transactions arrive with **no `getTransaction` round trip**, and filters accept up to `TX_FILTER_MAX_ACCOUNTS_GEYSER` (50k) accounts. Results are converted to the `getTransaction(json)` shape.
+- `logs`, `signature`, `root`, and non-base64/dataSlice account subs still go to the WS upstream (`SOLANA_WS_URL`). Without `GEYSER_URL`, everything stays on WS exactly as before.
+- Tests drive `GeyserUpstream` through an injected fake client/duplex stream rather than a real gRPC server. The real client is constructed lazily (and was checked to load), but it has not been run against a live Geyser endpoint (no token).
+
+### Compressed NFTs (best-effort Bubblegum indexer)
+`CNFT_TREES="tree:maxDepth,…"` indexes those trees from confirmed transactions (live via the transactionSubscribe engine, sequentially for ordering). `CNFT_BACKFILL=1` replays history from tree creation via `getSignaturesForAddress` (≤ `CNFT_BACKFILL_MAX`, default 5000). `CNFT_INDEX_FILE` persists the index.
+- It parses Bubblegum `mint_v1`, `mint_to_collection_v1`, `transfer` and `burn` instruction data, top-level and CPI (inner). It computes `data_hash`, `creator_hash`, the asset id (PDA) and the V1 leaf hash (keccak) exactly as Bubblegum does, and keeps a full concurrent-merkle-tree replica.
+- Served locally (without `DAS_RPC_URL`): `getAsset` / `getAssetBatch` (compression fields, owner, delegate, collection, burnt), `getAssetsByOwner` (cNFTs + SPL), `getAssetProof` / `getAssetProofBatch` (root, full proof, `node_index`, leaf).
+- **Limits:**
+  - The index is correct only if it saw every change since tree creation.
+  - Mint nonces are assumed sequential from 0.
+  - `delegate`, `redeem`/`decompress`, `verify_creator`, `set_and_verify_collection`, `update_metadata` and Bubblegum V2 are not modelled. Assets touched by them will diverge.
+  - `seq` is a local counter (no noop changelog parsing), and proofs are full depth (canopy ignored).
+  - Untracked trees return "not found".
+
 ### DAS API
 - With `DAS_RPC_URL` set (e.g. a Helius URL), all DAS methods (`getAsset getAssetBatch getAssetsByOwner getAssetsByGroup getAssetsByCreator getAssetsByAuthority searchAssets getAssetProof getAssetProofBatch getSignaturesForAsset getTokenAccounts getNftEditions`) are proxied as-is (object params).
 - Without it, there is a **best-effort on-chain fallback** for `getAsset`, `getAssetBatch` and `getAssetsByOwner`. It reads the SPL mint (`jsonParsed`) plus the Metaplex Token Metadata PDA (borsh-decoded: name, symbol, uri, royalties, creators, token standard, verified collection) and returns the Helius asset shape. `getAssetsByOwner` scans Token + Token-2022 accounts (zero balances hidden unless `displayOptions.showZeroBalance`) with `page`/`limit`.
   - The fallback has **no** off-chain JSON (`content.files/links` are empty), no compressed NFTs, no editions/print supply, no `burnt` detection and no price info.
-  - Other DAS methods return `-32601 "… requires DAS_RPC_URL"`.
+  - Token-2022 `tokenMetadata` extension names/symbols are used when there is no Metaplex metadata.
+  - `getAssetsByGroup` (collection) and `searchAssets` (`ownerAddress`, `grouping`, `creatorAddress`, `creatorVerified`, `burnt`, `compressed`, `tokenType`, `page`/`limit`) answer **from the local index** (indexed cNFTs + the owner's SPL tokens). Uncompressed collection members and arbitrary searches without an owner/group/creator are not covered, and unknown filters give `-32602`.
+  - `getSignaturesForAsset`, `getAssetsByCreator`, `getAssetsByAuthority`, `getTokenAccounts` and `getNftEditions` return `-32601 "… requires DAS_RPC_URL"`.
 
 ### transactionSubscribe (Helius Enhanced WS shape)
 `{"method":"transactionSubscribe","params":[{"accountInclude":[…],"accountExclude":[…],"accountRequired":[…],"vote":false,"failed":false},{"commitment":"confirmed","encoding":"json|jsonParsed|base64","transactionDetails":"full|signatures|none","maxSupportedTransactionVersion":0}]}`
 → `transactionNotification {subscription, result:{transaction:{transaction, meta, version}, signature, slot}}`, plus `transactionUnsubscribe`.
 - Implementation: one shared `logsSubscribe{mentions}` topic per account in `accountInclude ∪ accountRequired`. Each new signature (deduped) is fetched with `getTransaction` (bounded concurrency, retries) and then filtered on the full key set, including lookup-table `loadedAddresses`.
-- At least one include/required account is needed (max `TX_FILTER_MAX_ACCOUNTS`, default 100).
+- At least one include/required account is needed (max `TX_FILTER_MAX_ACCOUNTS`, default 100; 50k with `GEYSER_URL`, where no getTransaction is needed).
 
-### Webhooks (raw)
+### Webhooks (raw + enhanced)
 REST, scoped to the api key: `POST /v0/webhooks`, `GET /v0/webhooks`, `GET|PUT|DELETE /v0/webhooks/:id`. The body uses the Helius shape `{webhookURL, accountAddresses, transactionTypes:["ANY"], webhookType:"raw", authHeader?, txnStatus?}`.
 - Registrations persist to `WEBHOOKS_FILE` (atomic rewrite) and are re-armed at start-up.
 - Matching transactions (via the transactionSubscribe engine) are POSTed as a JSON **array** of raw `getTransaction` results, with `Authorization: <authHeader>`.
 - Failures (network or 5xx/408/429) are retried with exponential backoff (1s·2ⁿ, 5 retries). Other 4xx responses are permanent failures.
+- **Enhanced:** `webhookType:"enhanced"` POSTs Helius-shaped enhanced transactions: `{description, type, source, fee, feePayer, signature, slot, timestamp, nativeTransfers, tokenTransfers, accountData, transactionError, instructions, events}`.
+  - **Parsed types:**
+    - `TRANSFER`: System/SPL transfers only.
+    - `SWAP`: heuristic. The fee payer's net assets go out in one asset and come in in another. `source` comes from known DEX programs (Jupiter, Raydium, Orca, Meteora, Pump).
+    - `NFT_SALE`: minimal. A 0-decimal amount-1 token moves seller→buyer while SOL or wSOL moves buyer→seller. `source` is Magic Eden / Tensor when known.
+    - `COMPRESSED_NFT_MINT/TRANSFER/BURN`.
+    - Otherwise `UNKNOWN`.
+  - `transactionTypes` now **filters** (raw or enhanced). `ANY` matches everything, and unsupported type names give `400`.
+- **Persistence/backfill:** delivery stats (`delivered/failed/retries/lastError/lastSlot/backfilled`) persist to `WEBHOOKS_FILE.state.json`. On restart, each webhook catches up on txs with slot > `lastSlot`: the newest `backfillLimit` (200) signatures per address, oldest first, deduped by signature.
 
 ### Auth, rate limits, credits
 - **Binary port**: when `API_KEYS` is set, the first frame must be `Auth=8 {apiKey}`. Anything else (except Ping) gets an Error frame and the connection is closed. `RpcClient.connect(port, host, {apiKey})` re-authenticates on every reconnect, and a rejected key stops reconnecting.
@@ -95,23 +130,32 @@ await unsub();
 | `GET /health` | ✅ |
 | Read methods | ✅ `getHealth getVersion getSlot getBlockHeight getEpochInfo getLatestBlockhash getBalance getAccountInfo getMultipleAccounts(≤100) getTransaction getSignaturesForAddress(limit≤1000) getSignatureStatuses(≤256) getBlock getBlockTime getProgramAccounts(result cap GPA_MAX_RESULTS) getTokenAccountsByOwner getTokenAccountBalance getTokenSupply getMinimumBalanceForRentExemption getRecentPrioritizationFees` |
 | `getPriorityFeeEstimate` | ⚠️ Same request/response shape (`priorityLevel`, `includeAllPriorityFeeLevels`, `priorityFeeLevels{min,low,medium,high,veryHigh,unsafeMax}`). Accepts `accountKeys` **or a serialized `transaction`** (base58 default, `options.transactionEncoding:"Base64"`), whose static keys are decoded locally. Values are **approximated** from percentiles of `getRecentPrioritizationFees`. |
-| `sendTransaction` / `simulateTransaction` | ✅ relay + optional multi-upstream fan-out (no staked connections / Jito tips) |
-| DAS | ✅ proxied with `DAS_RPC_URL`; ⚠️ partial on-chain fallback otherwise |
-| `transactionSubscribe` | ⚠️ same filters and notification shape; logs+getTransaction backend (see below) |
-| Webhooks | ⚠️ `raw` type only, same REST/body shape |
+| `sendTransaction` / `simulateTransaction` | ✅ relay + multi-upstream fan-out + Sender-style Jito dual send (tip validated); no staked connections |
+| Jito `sendBundle` / `getBundleStatuses` / `getInflightBundleStatuses` / `getTipAccounts` | ✅ relayed to `JITO_URL`, bundles tip-validated |
+| DAS | ✅ proxied with `DAS_RPC_URL`; ⚠️ otherwise on-chain fallback + local cNFT index (`CNFT_TREES`) + local `searchAssets`/`getAssetsByGroup` |
+| `transactionSubscribe` | ✅ native with `GEYSER_URL` (≤50k accounts); ⚠️ logs+getTransaction backend otherwise |
+| Webhooks | ⚠️ `raw` + `enhanced` (TRANSFER / SWAP / NFT_SALE / cNFT types only), restart backfill |
 | Per-key rate limits / credits, `401`/`429` | ✅ (in-memory) |
 | Standard WS pubsub: `account/program/logs/signature/slot/root` `Subscribe`/`Unsubscribe` | ✅ Notification JSON is the exact upstream result (`{jsonrpc, method:"xNotification", params:{result, subscription}}`). An unknown subscription id → `-32602 "Invalid subscription id."`. |
 | Notification shapes | ✅ Checked live against mainnet (`npm run live`): proxy and direct-mainnet responses have identical key/type shapes. |
 
 ### Honest differences vs Helius
-- **Sending**: a plain relay to ordinary RPC upstreams with parallel fan-out. There are no staked connections / SWQoS, no Jito bundle or tip routing, and no server-side rebroadcast beyond the upstream `maxRetries`. Live checks only ever use `simulateTransaction`; tests use mocks only.
-- **DAS without `DAS_RPC_URL`** is a partial fallback: SPL mints and Metaplex metadata only. There is no off-chain JSON, no compressed NFTs or proofs, no search or group indexing, and no price data. `requestAirdrop` is not proxied.
-- **Not Geyser.** Helius LaserStream reads Geyser/gRPC (Yellowstone) directly from validators. This project relays standard Solana WebSocket pubsub, so latency and completeness are bounded by the upstream node.
-- **`transactionSubscribe`** costs one extra `getTransaction` per matching signature, so it adds latency (one RPC round trip, plus retries while the tx is not yet visible at `confirmed`).
-  - It cannot watch "all transactions": an include/required account is needed, and it is limited to 100 accounts rather than Helius's 50k.
-  - It only sees transactions whose logs mention the account. Upstream `logsSubscribe{mentions}` matches signers/writable/program keys, so a read-only account referenced only via a lookup table may be missed.
-  - `vote` filtering is heuristic (Vote program in logs/keys).
-- **Webhooks**: only `raw`, with no enhanced parsing (`transactionTypes` is stored but not used to filter). Delivery is one POST per transaction (no batching), there is no delivery dashboard (stats live in memory), and webhooks are lost if the process is down at the time of the transaction (no backfill).
+- **Sending:** still **no staked connections / SWQoS**. That needs a staked validator identity, and Helius's own stake, which a relay cannot provide.
+  - Jito dual send helps landing, but it is still a public block-engine submission.
+  - No server-side rebroadcast beyond upstream `maxRetries`.
+  - Live checks only ever use `simulateTransaction` and the read-only `getTipAccounts`. Tests use mocks only.
+- **DAS without `DAS_RPC_URL`:**
+  - No off-chain JSON (`files`/`links` empty) and no price data.
+  - cNFTs are covered only for `CNFT_TREES` trees and the modelled instructions (see Compressed NFTs).
+  - `searchAssets`/`getAssetsByGroup` see only the local index: indexed cNFTs plus the queried owner's tokens. There is no global collection/creator index for uncompressed NFTs.
+  - `requestAirdrop` is not proxied.
+- **Geyser** is optional and bring-your-own (`GEYSER_URL`/`GEYSER_TOKEN`), and it is only verified against a fake stream in tests.
+  - Without it, streaming is bounded by standard WS pubsub latency, and `transactionSubscribe` costs one `getTransaction` per matching signature (100-account cap, logs-mention coverage, heuristic vote filter).
+  - With it, tx `meta.err` is passed through as raw bincode bytes (base64) rather than the decoded JSON error, and `blockTime` is `null`.
+  - LaserStream's 24h historical replay is not provided.
+- **Enhanced webhooks** parse only TRANSFER, SWAP (heuristic), minimal NFT_SALE and Bubblegum cNFT types. Helius classifies hundreds of types and sources and has richer `events`.
+  - Delivery is one POST per transaction (no batching).
+  - Restart backfill is bounded (newest 200 signatures per address), so a long outage on a busy address can drop transactions.
 - **Replay** is in memory by default. With `STREAM_PERSIST_DIR` it survives restarts within `STREAM_RETENTION_MS` and the ring size, but only for topics that were active. Helius replays about 24h (≈216k slots) for any filter.
 - **Priority fee** is a heuristic. For v0 transactions only static keys are decoded (lookup-table keys aren't resolved).
 - **gPA limits**: results above `GPA_MAX_RESULTS` return `-32005`. There is no `getProgramAccountsV2` pagination. The public mainnet RPC also blocks gPA for large programs (`403`, passed through).
@@ -165,6 +209,10 @@ Unknowns (not implemented):
 
 `npm run live:alpenglow` checks detection and the observed slot rate against mainnet (1 RPC call plus 1 WS subscription). A sample run gave `{"consensus":"alpenglow","genesisSlot":459652999,"slotMs":269.1,...}`; the public node delivers slot notifications in bursts, so the observed figure sits above the nominal 200ms.
 
+`npm run spl-tokens -- <wallet> [max]` lists a wallet's SPL + Token-2022 balances (name, symbol, decimals, uiAmount) through the binary `RpcClient`. Names come from Metaplex metadata or the Token-2022 metadata extension. The cost is 2 `getTokenAccountsByOwner` calls plus 2 `getMultipleAccounts` calls per 50 mints. A live run on `86xCnPeV69n6t3DnyGvkKobf9FdN2H9oiVDdaMpo2MMY` found 1091 non-zero accounts. The top 50 resolved names for SPL and Token-2022 mints (e.g. `BRUV`, `GUACA` "Solana Power Boost" [Token-2022], `TOLY`).
+
+`npm run live:jito` makes one read-only `getTipAccounts` call through fast-rpc to the mainnet block engine. It returned the 8 tip accounts.
+
 ## Run
 ```
 npm install
@@ -180,7 +228,7 @@ curl -X POST 'localhost:7070/?api-key=KEY' -d '{"jsonrpc":"2.0","id":1,"method":
 curl -N 'localhost:7070/stream?type=slot'
 wscat -c 'ws://localhost:7070/?api-key=KEY' -x '{"jsonrpc":"2.0","id":1,"method":"slotSubscribe"}'
 ```
-Env: `SOLANA_RPC_URL`, `SOLANA_WS_URL` (defaults mainnet-beta public), `SOLANA_TIMEOUT_MS` (10000), `API_KEYS`, `PORT` (7070), `HOST` (127.0.0.1), `STREAM_RING` (2000), `STREAM_SOFT_LIMIT`, `STREAM_HARD_LIMIT`, `STREAM_SLOW_TIMEOUT_MS`, `MAX_FRAME_BYTES`, `GPA_MAX_RESULTS` (10000), `SEND_RPC_URLS`, `DAS_RPC_URL`, `WEBHOOKS_FILE`, `STREAM_PERSIST_DIR`, `STREAM_RETENTION_MS` (3600000), `KEY_LIMITS`, `DEFAULT_RPS`, `DEFAULT_CREDITS`, `TX_FILTER_MAX_ACCOUNTS` (100), `SLOT_MS` (200), `CHAIN_TRACK_SLOTS`, `CHAIN_DETECT`, `DEFAULT_COMMITMENT`, `ALPENGLOW_CONFIRMED_AS_FINALIZED`.
+Env: `SOLANA_RPC_URL`, `SOLANA_WS_URL` (defaults mainnet-beta public), `SOLANA_TIMEOUT_MS` (10000), `API_KEYS`, `PORT` (7070), `HOST` (127.0.0.1), `STREAM_RING` (2000), `STREAM_SOFT_LIMIT`, `STREAM_HARD_LIMIT`, `STREAM_SLOW_TIMEOUT_MS`, `MAX_FRAME_BYTES`, `GPA_MAX_RESULTS` (10000), `SEND_RPC_URLS`, `DAS_RPC_URL`, `WEBHOOKS_FILE`, `STREAM_PERSIST_DIR`, `STREAM_RETENTION_MS` (3600000), `KEY_LIMITS`, `DEFAULT_RPS`, `DEFAULT_CREDITS`, `TX_FILTER_MAX_ACCOUNTS` (100), `TX_FILTER_MAX_ACCOUNTS_GEYSER` (50000), `GEYSER_URL`, `GEYSER_TOKEN`, `JITO_URL`, `JITO_UUID`, `JITO_MIN_TIP_LAMPORTS` (1000), `SEND_JITO`, `CNFT_TREES`, `CNFT_INDEX_FILE`, `CNFT_BACKFILL`, `CNFT_BACKFILL_MAX` (5000), `SLOT_MS` (200), `CHAIN_TRACK_SLOTS`, `CHAIN_DETECT`, `DEFAULT_COMMITMENT`, `ALPENGLOW_CONFIRMED_AS_FINALIZED`.
 The public mainnet endpoint is rate-limited; point `SOLANA_RPC_URL`/`SOLANA_WS_URL` at your own node or a provider for real load.
 
 ## Layout
@@ -197,6 +245,10 @@ src/txstream.ts     TxWatcher: transactionSubscribe engine (logs topics + getTra
 src/webhooks.ts     WebhookManager: REST CRUD, JSON persistence, delivery w/ retries
 src/limits.ts       per-key token bucket + credits
 src/chain.ts        ChainState: observed slot rate, Alpenglow detection, commitment defaults
+src/jito.ts         Jito block-engine relay + tip validation
+src/geyser.ts       GeyserUpstream: Yellowstone gRPC slot/account/program/tx streams, WS fallback
+src/bubblegum.ts    CnftIndexer: Bubblegum parsing, leaf hashing, merkle replica, proofs, persistence
+src/enhanced.ts     parseEnhanced: TRANSFER / SWAP / NFT_SALE / cNFT enhanced tx shape
 src/app.ts          createFastRpc() wiring
 test/*.test.ts      node:test suites + mock Solana node + unpluggable TCP proxy
 ```

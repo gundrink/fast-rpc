@@ -66,7 +66,7 @@ function readCompactU16(b: Buffer, o: number): [number, number] {
   return [v, o + i];
 }
 
-export interface DecodedTx { version: "legacy" | number; signatures: string[]; accountKeys: string[]; numRequiredSignatures: number; lookupTables: { account: string; writable: number[]; readonly: number[] }[] }
+export interface DecodedTx { version: "legacy" | number; signatures: string[]; accountKeys: string[]; numRequiredSignatures: number; lookupTables: { account: string; writable: number[]; readonly: number[] }[]; instructions: { programIdIndex: number; accounts: number[]; data: Buffer }[] }
 
 /** Decode a serialized (base64 or base58) legacy/v0 transaction: static keys + lookup table refs. */
 export function decodeTransaction(tx: string, encoding?: "base64" | "base58"): DecodedTx {
@@ -86,7 +86,12 @@ export function decodeTransaction(tx: string, encoding?: "base64" | "base58"): D
   for (let i = 0; i < nkeys; i++) { accountKeys.push(b58encode(b.subarray(o, o + 32))); o += 32; }
   o += 32; // recent blockhash
   let nix; [nix, o] = readCompactU16(b, o);
-  for (let i = 0; i < nix; i++) { o++; let n; [n, o] = readCompactU16(b, o); o += n; [n, o] = readCompactU16(b, o); o += n; }
+  const instructions: DecodedTx["instructions"] = [];
+  for (let i = 0; i < nix; i++) {
+    const programIdIndex = b[o++]; let n; [n, o] = readCompactU16(b, o); const accounts = [...b.subarray(o, o + n)]; o += n;
+    [n, o] = readCompactU16(b, o); const data = Buffer.from(b.subarray(o, o + n)); o += n;
+    instructions.push({ programIdIndex, accounts, data });
+  }
   const lookupTables: DecodedTx["lookupTables"] = [];
   if (version === 0 && o < b.length) {
     let nl; [nl, o] = readCompactU16(b, o);
@@ -98,7 +103,7 @@ export function decodeTransaction(tx: string, encoding?: "base64" | "base58"): D
     }
   }
   if (o > b.length) throw new Error("truncated transaction");
-  return { version, signatures, accountKeys, numRequiredSignatures, lookupTables };
+  return { version, signatures, accountKeys, numRequiredSignatures, lookupTables, instructions };
 }
 
 /** Test helper: build a minimal legacy tx (zero signatures) with given keys. */

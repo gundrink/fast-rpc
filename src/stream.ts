@@ -1,5 +1,6 @@
 // Subscription manager: one upstream sub per topic, fan-out, dedup, seq numbers, ring buffer replay.
 import { SolanaWs, Upstream } from "./upstream-ws.js";
+import { GeyserUpstream } from "./geyser.js";
 import { INVALID_PARAMS } from "./errors.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -45,7 +46,7 @@ const SPEC: Record<StreamType, { validate(raw: any[]): void; slot(r: any): numbe
 };
 
 export interface HubOptions {
-  upstream?: Upstream; wsUrl?: string; ringSize?: number; lingerMs?: number; log?: (...a: any[]) => void;
+  upstream?: Upstream; wsUrl?: string; /** Yellowstone gRPC endpoint (GEYSER_URL) + x-token (GEYSER_TOKEN) */ geyserUrl?: string; geyserToken?: string; ringSize?: number; lingerMs?: number; log?: (...a: any[]) => void;
   /** Directory for the append-only disk ring (survives restarts). Default: STREAM_PERSIST_DIR env. */
   persistDir?: string;
   /** Drop persisted entries older than this. Default: STREAM_RETENTION_MS env or 1h. */
@@ -172,7 +173,9 @@ export class StreamHub {
     this.retentionMs = opts.retentionMs ?? Number(process.env.STREAM_RETENTION_MS ?? 3_600_000);
     this.log = opts.log;
     if (this.persistDir) fs.mkdirSync(this.persistDir, { recursive: true });
-    this.upstream = opts.upstream ?? new SolanaWs(opts.wsUrl, opts.log);
+    this.upstream = opts.upstream ?? (opts.geyserUrl ?? process.env.GEYSER_URL
+      ? new GeyserUpstream({ url: opts.geyserUrl ?? process.env.GEYSER_URL, token: opts.geyserToken ?? process.env.GEYSER_TOKEN, fallback: new SolanaWs(opts.wsUrl, opts.log), log: opts.log })
+      : new SolanaWs(opts.wsUrl, opts.log));
     this.ringSize = opts.ringSize ?? Number(process.env.STREAM_RING ?? 2000);
     this.lingerMs = opts.lingerMs ?? 10_000;
   }

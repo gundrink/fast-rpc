@@ -1,30 +1,96 @@
-// Helius-like webhooks (raw): REST CRUD, persisted to JSON, backed by TxWatcher, POST delivery w/ retries.
+// Helius-like webhooks (raw + enhanced): REST CRUD, persisted to JSON, backed by TxWatcher, POST delivery w/ retries.
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { StreamHub } from "./stream.js";
 import { TxWatcher, type GetTx } from "./txstream.js";
 import { isPubkey } from "./codec.js";
+import { parseEnhanced, TX_TYPES } from "./enhanced.js";
 
-export interface Webhook { webhookID: string; wallet: string; webhookURL: string; transactionTypes: string[]; accountAddresses: string[]; webhookType: "raw" | "rawDevnet"; authHeader?: string; txnStatus?: "all" | "success" | "failed" }
-export interface WebhookOptions { file?: string; maxRetries?: number; baseDelayMs?: number; timeoutMs?: number; maxPerKey?: number; log?: (...a: any[]) => void }
+export interface Webhook { webhookID: string; wallet: string; webhookURL: string; transactionTypes: string[]; accountAddresses: string[]; webhookType: "raw" | "rawDevnet" | "enhanced" | "enhancedDevnet"; authHeader?: string; txnStatus?: "all" | "success" | "failed" }
+export interface WebhookOptions {
+  /** JSON-RPC caller used for restart backfill (getSignaturesForAddress + getTransaction) */
+  rpc?: (method: string, params: any[]) => Promise<any>;
+  /** max signatures per address fetched on restart backfill (default 200) */
+  backfillLimit?: number;
+  file?: string; maxRetries?: number; baseDelayMs?: number; timeoutMs?: number; maxPerKey?: number; log?: (...a: any[]) => void }
 
 export class WebhookError extends Error { constructor(public status: number, msg: string) { super(msg); } }
 
 export class WebhookManager {
   private hooks = new Map<string, Webhook>();
   private watchers = new Map<string, TxWatcher>();
-  stats = new Map<string, { delivered: number; failed: number; retries: number; lastError?: string }>();
-  private o: Required<Omit<WebhookOptions, "file" | "log">> & { file?: string; log: (...a: any[]) => void };
+  stats = new Map<string, { delivered: number; failed: number; retries: number; lastError?: string; lastSlot?: number; backfilled?: number }>();
+  private o: Required<Omit<WebhookOptions, "file" | "log" | "rpc">> & { file?: string; log: (...a: any[]) => void; rpc?: WebhookOptions["rpc"] };
+  private stateT?: NodeJS.Timeout;
+  private delivered = new Map<string, Set<string>>();
+  /** resolves when restart backfill is done */
+  ready: Promise<void> = Promise.resolve();
   private pending = new Set<Promise<void>>();
 
   constructor(private hub: StreamHub, private getTx: GetTx, opts: WebhookOptions = {}) {
     this.o = { file: opts.file ?? process.env.WEBHOOKS_FILE, maxRetries: opts.maxRetries ?? 5, baseDelayMs: opts.baseDelayMs ?? 1000,
-      timeoutMs: opts.timeoutMs ?? 10_000, maxPerKey: opts.maxPerKey ?? 50, log: opts.log ?? (() => {}) };
+      timeoutMs: opts.timeoutMs ?? 10_000, maxPerKey: opts.maxPerKey ?? 50, log: opts.log ?? (() => {}), rpc: opts.rpc, backfillLimit: opts.backfillLimit ?? 200 };
     if (this.o.file && fs.existsSync(this.o.file)) {
-      try { for (const h of JSON.parse(fs.readFileSync(this.o.file, "utf8")) as Webhook[]) { this.hooks.set(h.webhookID, h); this.start(h); } }
+      try {
+        for (const h of JSON.parse(fs.readFileSync(this.o.file, "utf8")) as Webhook[]) this.hooks.set(h.webhookID, h);
+        const sf = `${this.o.file}.state.json`;
+        if (fs.existsSync(sf)) for (const [id, st] of Object.entries<any>(JSON.parse(fs.readFileSync(sf, "utf8")))) if (this.hooks.has(id)) this.stats.set(id, st);
+        for (const h of this.hooks.values()) this.start(h);
+        this.ready = Promise.all([...this.hooks.values()].map((h) => this.backfill(h).catch((e) => this.o.log("[webhooks] backfill failed", h.webhookID, e?.message)))).then(() => {});
+      }
       catch (e: any) { this.o.log("[webhooks] failed to load", e.message); }
     }
+  }
+
+  private saveState() {
+    if (!this.o.file || this.stateT) return;
+    this.stateT = setTimeout(() => { this.stateT = undefined; this.writeState(); }, 200); this.stateT.unref();
+  }
+  private writeState() {
+    if (!this.o.file) return;
+    fs.mkdirSync(path.dirname(path.resolve(this.o.file)), { recursive: true });
+    const f = `${this.o.file}.state.json`;
+    fs.writeFileSync(`${f}.tmp`, JSON.stringify(Object.fromEntries(this.stats))); fs.renameSync(`${f}.tmp`, f);
+  }
+  private st(id: string) { let s = this.stats.get(id); if (!s) { s = { delivered: 0, failed: 0, retries: 0 }; this.stats.set(id, s); } return s; }
+
+  /** Restart catch-up: txs for the hook's addresses with slot > lastSlot, oldest first (bounded by backfillLimit/address). */
+  private async backfill(h: Webhook) {
+    const st = this.stats.get(h.webhookID); const from = st?.lastSlot; const rpc = this.o.rpc;
+    if (!rpc || !from) return;
+    const sigs = new Map<string, number>();
+    for (const a of h.accountAddresses) {
+      const page: any[] = await rpc("getSignaturesForAddress", [a, { limit: Math.min(1000, this.o.backfillLimit), commitment: "confirmed" }]);
+      for (const s of page ?? []) if (s.slot > from && !(h.txnStatus === "success" && s.err) && !(h.txnStatus === "failed" && !s.err)) sigs.set(s.signature, s.slot);
+    }
+    const ordered = [...sigs].sort((x, y) => x[1] - y[1]);
+    let n = 0;
+    for (const [sig] of ordered) {
+      const r = await rpc("getTransaction", [sig, { encoding: "json", maxSupportedTransactionVersion: 0, commitment: "confirmed" }]).catch(() => null);
+      if (r && this.handle(h, r)) n++;
+    }
+    this.st(h.webhookID).backfilled = (this.st(h.webhookID).backfilled ?? 0) + n; this.saveState();
+  }
+
+  /** filter + deliver one tx; returns true if queued for delivery */
+  private handle(h: Webhook, tx: any): boolean {
+    if (h.txnStatus === "failed" && !tx.meta?.err) return false;
+    if (h.txnStatus === "success" && tx.meta?.err) return false;
+    const sig = tx.transaction?.signatures?.[0];
+    let seen = this.delivered.get(h.webhookID); if (!seen) { seen = new Set(); this.delivered.set(h.webhookID, seen); }
+    if (sig) { if (seen.has(sig)) return false; seen.add(sig); if (seen.size > 10_000) seen.delete(seen.values().next().value!); }
+    const enhanced = h.webhookType.startsWith("enhanced");
+    const types = h.transactionTypes ?? ["ANY"];
+    let payload: any = tx;
+    if (enhanced || !types.includes("ANY")) {
+      const e = parseEnhanced(tx);
+      if (!types.includes("ANY") && !types.includes(e.type)) return false;
+      if (enhanced) payload = e;
+    }
+    const s = this.st(h.webhookID); s.lastSlot = Math.max(s.lastSlot ?? 0, tx.slot ?? 0); this.saveState();
+    const p = this.deliver(h, [payload]); this.pending.add(p); p.finally(() => this.pending.delete(p));
+    return true;
   }
 
   private save() {
@@ -49,12 +115,14 @@ export class WebhookManager {
       out.accountAddresses = [...new Set(b.accountAddresses as string[])];
     }
     if (b.webhookType !== undefined || !partial) {
-      if (!["raw", "rawDevnet"].includes(b.webhookType ?? "raw")) throw new WebhookError(400, "only webhookType raw/rawDevnet is supported (no enhanced parsing)");
+      if (!["raw", "rawDevnet", "enhanced", "enhancedDevnet"].includes(b.webhookType ?? "raw")) throw new WebhookError(400, "webhookType must be raw|rawDevnet|enhanced|enhancedDevnet");
       out.webhookType = b.webhookType ?? "raw";
     }
     if (b.transactionTypes !== undefined || !partial) {
       const t = b.transactionTypes ?? ["ANY"];
-      if (!Array.isArray(t) || !t.every((x) => typeof x === "string")) throw new WebhookError(400, "transactionTypes must be a string array");
+      if (!Array.isArray(t) || !t.length || !t.every((x) => typeof x === "string")) throw new WebhookError(400, "transactionTypes must be a non-empty string array");
+      const bad = t.filter((x: string) => !(TX_TYPES as readonly string[]).includes(x));
+      if (bad.length) throw new WebhookError(400, `unsupported transactionTypes: ${bad.join(",")} (supported: ${TX_TYPES.join(",")})`);
       out.transactionTypes = t;
     }
     if (b.authHeader !== undefined) { if (typeof b.authHeader !== "string") throw new WebhookError(400, "authHeader must be a string"); out.authHeader = b.authHeader; }
@@ -75,21 +143,18 @@ export class WebhookManager {
     this.hooks.set(id, h); this.save(); this.stop(id); this.start(h);
     return h;
   }
-  delete(wallet: string, id: string) { this.get(wallet, id); this.stop(id); this.hooks.delete(id); this.stats.delete(id); this.save(); }
+  delete(wallet: string, id: string) { this.get(wallet, id); this.stop(id); this.hooks.delete(id); this.stats.delete(id); this.save(); this.saveState(); }
 
   private start(h: Webhook) {
     const failed = h.txnStatus === "success" ? false : undefined;
-    const w = new TxWatcher(this.hub, this.getTx, { accountInclude: h.accountAddresses, failed, vote: false }, { encoding: "json" }, (e) => {
-      if (h.txnStatus === "failed" && !e.tx.meta?.err) return;
-      const p = this.deliver(h, [e.tx]); this.pending.add(p); p.finally(() => this.pending.delete(p));
-    });
+    const w = new TxWatcher(this.hub, this.getTx, { accountInclude: h.accountAddresses, failed, vote: false }, { encoding: "json" }, (e) => { this.handle(h, e.tx); });
     this.watchers.set(h.webhookID, w);
   }
   private stop(id: string) { this.watchers.get(id)?.stop(); this.watchers.delete(id); }
 
   /** POST payload (Helius raw webhooks send an array of transactions); exponential backoff on failure/non-2xx. */
   private async deliver(h: Webhook, payload: any[]) {
-    const st = this.stats.get(h.webhookID) ?? { delivered: 0, failed: 0, retries: 0 }; this.stats.set(h.webhookID, st);
+    const st = this.st(h.webhookID);
     const body = JSON.stringify(payload);
     for (let attempt = 0; attempt <= this.o.maxRetries; attempt++) {
       if (!this.hooks.has(h.webhookID)) return;
@@ -97,14 +162,14 @@ export class WebhookManager {
         const r = await fetch(h.webhookURL, { method: "POST", body, signal: AbortSignal.timeout(this.o.timeoutMs),
           headers: { "content-type": "application/json", ...(h.authHeader ? { authorization: h.authHeader } : {}) } });
         await r.arrayBuffer().catch(() => {});
-        if (r.ok) { st.delivered++; return; }
+        if (r.ok) { st.delivered++; this.saveState(); return; }
         st.lastError = `HTTP ${r.status}`;
         if (r.status >= 400 && r.status < 500 && r.status !== 408 && r.status !== 429) break; // permanent
       } catch (e: any) { st.lastError = e?.message ?? String(e); }
       if (attempt < this.o.maxRetries) { st.retries++; await new Promise((res) => setTimeout(res, this.o.baseDelayMs * 2 ** attempt)); }
     }
-    st.failed++; this.o.log(`[webhooks] delivery failed ${h.webhookID}: ${st.lastError}`);
+    st.failed++; this.saveState(); this.o.log(`[webhooks] delivery failed ${h.webhookID}: ${st.lastError}`);
   }
   async idle() { await Promise.all([...this.pending]); }
-  close() { for (const id of [...this.watchers.keys()]) this.stop(id); }
+  close() { for (const id of [...this.watchers.keys()]) this.stop(id); if (this.stateT) { clearTimeout(this.stateT); this.stateT = undefined; this.writeState(); } }
 }

@@ -14,15 +14,19 @@
     "typecheck": "tsc --noEmit --types node --target es2022 --module nodenext --moduleResolution nodenext --strict --skipLibCheck src/*.ts examples/*.ts test/*.ts",
     "live": "tsx examples/live-check.ts",
     "live:sim": "tsx examples/live-sim.ts",
-    "live:alpenglow": "tsx examples/alpenglow-check.ts"
+    "live:alpenglow": "tsx examples/alpenglow-check.ts",
+    "spl-tokens": "tsx examples/spl-tokens.ts",
+    "live:jito": "tsx examples/jito-tips.ts"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "module",
   "dependencies": {
+    "@noble/hashes": "^2.4.0",
     "msgpackr": "^2.1.2",
-    "ws": "^8.22.0"
+    "ws": "^8.22.0",
+    "@triton-one/yellowstone-grpc": "^9.0.1"
   },
   "devDependencies": {
     "@types/node": "^26.6.5",

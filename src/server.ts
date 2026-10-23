@@ -6,7 +6,7 @@ import { RpcError } from "./errors.js";
 import { STREAM_TYPES, type StreamHub, type StreamType, type Entry } from "./stream.js";
 import { Limiter } from "./limits.js";
 import type { ChainState } from "./chain.js";
-import { TxWatcher, validateTxFilter, heliusTxResult, type GetTx } from "./txstream.js";
+import { TxWatcher, validateTxFilter, nativeTx, MAX_FILTER_ACCOUNTS, MAX_FILTER_ACCOUNTS_GEYSER, heliusTxResult, type GetTx } from "./txstream.js";
 import { WebhookError, type WebhookManager } from "./webhooks.js";
 
 type Handler = (...args: any[]) => any | Promise<any>;
@@ -352,7 +352,7 @@ export class RpcServer {
         if (!this.hub || !this.getTx) return rpcErr(id, -32601, "Method not found");
         try {
           const p = Array.isArray(r.params) ? r.params : [];
-          const filter = validateTxFilter(p[0]); const o = p[1] ?? {};
+          const filter = validateTxFilter(p[0], nativeTx(this.hub!) ? MAX_FILTER_ACCOUNTS_GEYSER : MAX_FILTER_ACCOUNTS); const o = p[1] ?? {};
           if (typeof o !== "object") throw new RpcError(-32602, "transactionSubscribe: options must be an object");
           const sid = this.nextWsSub++;
           const w = new TxWatcher(this.hub, this.getTx, filter, o, (e) => {

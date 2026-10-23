@@ -5,6 +5,7 @@ import { encode, FrameDecoder, MsgType } from "./protocol.js";
 import { RpcError } from "./errors.js";
 import { STREAM_TYPES, type StreamHub, type StreamType, type Entry } from "./stream.js";
 import { Limiter } from "./limits.js";
+import type { ChainState } from "./chain.js";
 import { TxWatcher, validateTxFilter, heliusTxResult, type GetTx } from "./txstream.js";
 import { WebhookError, type WebhookManager } from "./webhooks.js";
 
@@ -89,6 +90,8 @@ export class RpcServer {
   /** getTx enables transactionSubscribe (logs topics + getTransaction). */
   attachStreams(hub: StreamHub, getTx?: GetTx) { this.hub = hub; this.getTx = getTx; return this; }
   attachWebhooks(m: WebhookManager) { this.webhooks = m; return this; }
+  attachChain(c: ChainState) { this.chain = c; return this; }
+  private chain?: ChainState;
   get limiter() { return this.o.limiter; }
   private getTx?: GetTx;
   private webhooks?: WebhookManager;
@@ -249,6 +252,7 @@ export class RpcServer {
       try { this.o.limiter.take(key, "subscribe"); } catch (e: any) { return this.json(res, 429, rpcErr(null, e.code, e.message)); }
       return this.sse(req, res, url);
     }
+    if (req.method === "GET" && url.pathname === "/v0/chain") return this.json(res, 200, this.chain?.status() ?? { consensus: "unknown", reason: "no chain state" });
     if (req.method === "GET" && url.pathname === "/v0/usage") return this.json(res, 200, this.o.limiter.report(key));
     if (url.pathname === "/v0/webhooks" || url.pathname.startsWith("/v0/webhooks/")) return this.rest(req, res, url, key);
     if (req.method !== "POST") return this.json(res, 405, rpcErr(null, -32600, "Use POST for JSON-RPC"));

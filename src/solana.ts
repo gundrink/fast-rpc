@@ -2,6 +2,7 @@
 import { RpcError, INVALID_PARAMS } from "./errors.js";
 import { decodeTransaction } from "./codec.js";
 import { createDas } from "./das.js";
+import { ChainState } from "./chain.js";
 
 export const upstreamUrl = process.env.SOLANA_RPC_URL ?? "https://api.mainnet-beta.solana.com";
 export interface SolanaApiOptions {
@@ -10,6 +11,8 @@ export interface SolanaApiOptions {
   sendUrls?: string[];
   /** DAS-capable RPC (e.g. a Helius URL). Default: DAS_RPC_URL env. Without it, on-chain fallback for getAsset/getAssetsByOwner */
   dasUrl?: string;
+  /** slot-rate / consensus state (Alpenglow-aware TTLs and commitment). */
+  chain?: ChainState;
 }
 
 export function createUpstream(url = upstreamUrl, timeoutMs = Number(process.env.SOLANA_TIMEOUT_MS ?? 10_000)) {
@@ -67,9 +70,16 @@ export function createSolanaApi(opts: SolanaApiOptions = {}) {
     try { return decodeTransaction(a[0], enc); } catch (e: any) { throw INVALID_PARAMS(`${m}: failed to deserialize transaction: ${e.message}`); }
   };
   const gpaMax = opts.gpaMaxResults ?? Number(process.env.GPA_MAX_RESULTS ?? 10_000);
-  const clean = (a: any[]) => { const b = [...a]; while (b.length && b[b.length - 1] === undefined) b.pop(); return b; };
+  const chain = opts.chain ?? new ChainState();
+  // trailing-undefined trim + optional confirmed->finalized rewrite (ALPENGLOW_CONFIRMED_AS_FINALIZED, only once Alpenglow is detected)
+  const clean = (a: any[]) => {
+    const b = [...a]; while (b.length && b[b.length - 1] === undefined) b.pop();
+    return b.map((x) => x && typeof x === "object" && !Array.isArray(x) && typeof x.commitment === "string" ? { ...x, commitment: chain.mapCommitment(x.commitment) } : x);
+  };
+  /** TTL of n slots at the current (observed) slot rate: no hardcoded 400ms. */
+  const slotTtl = (n: number) => () => chain.slots(n);
   // Generic read-only passthrough with positional params (Solana style).
-  const pass = (method: string, ttl = 0, check?: (a: any[]) => void) => (...a: any[]) => { const p = clean(a); check?.(p); return up(method, p, ttl); };
+  const pass = (method: string, ttl: number | (() => number) = 0, check?: (a: any[]) => void) => (...a: any[]) => { const p = clean(a); check?.(p); return up(method, p, typeof ttl === "function" ? ttl() : ttl); };
   const needKey = (m: string) => (a: any[]) => { if (typeof a[0] !== "string" || !a[0]) throw INVALID_PARAMS(`${m}: params[0] must be a base58 string`); };
 
   const api = {
@@ -85,18 +95,18 @@ export function createSolanaApi(opts: SolanaApiOptions = {}) {
     simulateTransaction: async (...a: any[]) => { const p = clean(a); checkTx("simulateTransaction", p); return up("simulateTransaction", p, 0); },
     getHealth: pass("getHealth", 1000),
     getVersion: pass("getVersion", 60_000),
-    getSlot: pass("getSlot", 400),
-    getBlockHeight: pass("getBlockHeight", 400),
-    getEpochInfo: pass("getEpochInfo", 1000),
-    getLatestBlockhash: pass("getLatestBlockhash", 400),
-    getBalance: pass("getBalance", 1000, needKey("getBalance")),
-    getAccountInfo: pass("getAccountInfo", 400, needKey("getAccountInfo")),
-    getMultipleAccounts: pass("getMultipleAccounts", 400, (a) => {
+    getSlot: pass("getSlot", slotTtl(1)),
+    getBlockHeight: pass("getBlockHeight", slotTtl(1)),
+    getEpochInfo: pass("getEpochInfo", slotTtl(2)),
+    getLatestBlockhash: pass("getLatestBlockhash", slotTtl(1)),
+    getBalance: pass("getBalance", slotTtl(2), needKey("getBalance")),
+    getAccountInfo: pass("getAccountInfo", slotTtl(1), needKey("getAccountInfo")),
+    getMultipleAccounts: pass("getMultipleAccounts", slotTtl(1), (a) => {
       if (!Array.isArray(a[0]) || a[0].length === 0) throw INVALID_PARAMS("getMultipleAccounts: params[0] must be a non-empty array");
       if (a[0].length > 100) throw INVALID_PARAMS("getMultipleAccounts: max 100 pubkeys");
     }),
     getTransaction: pass("getTransaction", 60_000, needKey("getTransaction")),
-    getSignaturesForAddress: pass("getSignaturesForAddress", 1000, (a) => {
+    getSignaturesForAddress: pass("getSignaturesForAddress", slotTtl(2), (a) => {
       needKey("getSignaturesForAddress")(a);
       if (a[1]?.limit != null && (a[1].limit < 1 || a[1].limit > 1000)) throw INVALID_PARAMS("getSignaturesForAddress: limit must be 1..1000");
     }),
@@ -105,14 +115,16 @@ export function createSolanaApi(opts: SolanaApiOptions = {}) {
     }),
     getBlock: pass("getBlock", 60_000, (a) => { if (!Number.isInteger(a[0])) throw INVALID_PARAMS("getBlock: params[0] must be a slot number"); }),
     getBlockTime: pass("getBlockTime", 60_000),
-    getTokenAccountsByOwner: pass("getTokenAccountsByOwner", 1000, (a) => {
+    getTokenAccountsByOwner: pass("getTokenAccountsByOwner", slotTtl(2), (a) => {
       needKey("getTokenAccountsByOwner")(a);
       if (!a[1] || (typeof a[1].mint !== "string" && typeof a[1].programId !== "string")) throw INVALID_PARAMS("getTokenAccountsByOwner: params[1] must be {mint} or {programId}");
     }),
-    getTokenAccountBalance: pass("getTokenAccountBalance", 1000, needKey("getTokenAccountBalance")),
+    getTokenAccountBalance: pass("getTokenAccountBalance", slotTtl(2), needKey("getTokenAccountBalance")),
     getTokenSupply: pass("getTokenSupply", 5000, needKey("getTokenSupply")),
     getMinimumBalanceForRentExemption: pass("getMinimumBalanceForRentExemption", 60_000),
-    getRecentPrioritizationFees: pass("getRecentPrioritizationFees", 1000),
+    getRecentPrioritizationFees: pass("getRecentPrioritizationFees", slotTtl(2)),
+    /** Alpenglow detection (Agave 4.3+): null = TowerBFT, object = genesis certificate. */
+    getAgGenesisCert: pass("getAgGenesisCert", 10_000),
     getProgramAccounts: async (...a: any[]) => {
       const p = clean(a); needKey("getProgramAccounts")(p);
       const cfg = p[1] ?? {};
@@ -134,7 +146,12 @@ export function createSolanaApi(opts: SolanaApiOptions = {}) {
         } catch (e: any) { throw INVALID_PARAMS(`getPriorityFeeEstimate: cannot decode transaction: ${e.message}`); }
       }
       if (keys.length > 128) throw INVALID_PARAMS("getPriorityFeeEstimate: max 128 accountKeys");
-      const fees: { slot: number; prioritizationFee: number }[] = await up("getRecentPrioritizationFees", keys.length ? [keys.slice(0, 128)] : [], 1000);
+      const o0 = req.options ?? {};
+      if (o0.lookbackSlots !== undefined && !(Number.isInteger(o0.lookbackSlots) && o0.lookbackSlots >= 1 && o0.lookbackSlots <= 150))
+        throw INVALID_PARAMS("getPriorityFeeEstimate: options.lookbackSlots must be an integer 1..150");
+      let fees: { slot: number; prioritizationFee: number }[] = await up("getRecentPrioritizationFees", keys.length ? [keys.slice(0, 128)] : [], chain.slots(2));
+      // window is expressed in SLOTS (node returns up to 150), not seconds: 150 slots = 60s at 400ms, 30s at 200ms
+      if (o0.lookbackSlots) { const top = fees.reduce((m, f) => Math.max(m, f.slot), 0); fees = fees.filter((f) => f.slot > top - o0.lookbackSlots); }
       const v = fees.map((f) => f.prioritizationFee).sort((x, y) => x - y);
       const pct = (q: number) => (v.length ? v[Math.min(v.length - 1, Math.max(0, Math.ceil((q / 100) * v.length) - 1))] : 0);
       const levels = { min: v[0] ?? 0, low: pct(25), medium: pct(50), high: pct(75), veryHigh: pct(95), unsafeMax: v.at(-1) ?? 0 };

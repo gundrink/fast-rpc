@@ -79,7 +79,7 @@ export class WebhookManager {
 
   private start(h: Webhook) {
     const failed = h.txnStatus === "success" ? false : undefined;
-    const w = new TxWatcher(this.hub, this.getTx, { accountInclude: h.accountAddresses, failed, vote: false }, { encoding: "json", commitment: "confirmed" }, (e) => {
+    const w = new TxWatcher(this.hub, this.getTx, { accountInclude: h.accountAddresses, failed, vote: false }, { encoding: "json" }, (e) => {
       if (h.txnStatus === "failed" && !e.tx.meta?.err) return;
       const p = this.deliver(h, [e.tx]); this.pending.add(p); p.finally(() => this.pending.delete(p));
     });

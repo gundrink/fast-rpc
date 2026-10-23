@@ -4,6 +4,7 @@ import { INVALID_PARAMS } from "./errors.js";
 import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
+import { ChainState } from "./chain.js";
 
 export const STREAM_TYPES = ["slot", "root", "account", "program", "logs", "signature"] as const;
 export type StreamType = (typeof STREAM_TYPES)[number];
@@ -15,8 +16,8 @@ const isStr = (x: any) => typeof x === "string" && x.length > 0 && x.length <= 1
 const isCfg = (x: any) => x === undefined || (x !== null && typeof x === "object" && !Array.isArray(x));
 
 /** Binary-API object params -> raw Solana subscribe params. */
-export function toRawParams(type: StreamType, p: any = {}): any[] {
-  const cfg = (extra: object = {}) => ({ commitment: p.commitment ?? "confirmed", ...extra });
+export function toRawParams(type: StreamType, p: any = {}, defaultCommitment = "confirmed"): any[] {
+  const cfg = (extra: object = {}) => ({ commitment: p.commitment ?? defaultCommitment, ...extra });
   switch (type) {
     case "slot": case "root": return [];
     case "account": return [p.pubkey, cfg({ encoding: p.encoding ?? "base64" })];
@@ -49,6 +50,8 @@ export interface HubOptions {
   persistDir?: string;
   /** Drop persisted entries older than this. Default: STREAM_RETENTION_MS env or 1h. */
   retentionMs?: number;
+  /** shared slot-rate/consensus state; slot topics feed it observations */
+  chain?: ChainState;
 }
 
 /** Append-only JSONL log per topic: {seq,slot,ts,k,raw}. Compacted to the ring when it grows past 2x ringSize. */
@@ -119,6 +122,7 @@ class Topic {
       let k: string, e: Entry;
       try { k = spec.key(r); e = { seq: 0, slot: spec.slot(r), data: spec.data(r), raw: r }; }
       catch { return; } // malformed upstream message
+      if (this.type === "slot") this.hub.chain.observe(e.slot);
       if (this.seen.has(k)) return; // dedup (e.g. replays after upstream reconnect)
       this.seen.add(k); this.seenQ.push(k);
       if (this.seenQ.length > 8192) this.seen.delete(this.seenQ.shift()!);
@@ -161,7 +165,9 @@ export class StreamHub {
   readonly persistDir?: string;
   readonly retentionMs: number;
   readonly log?: (...a: any[]) => void;
+  readonly chain: ChainState;
   constructor(opts: HubOptions = {}) {
+    this.chain = opts.chain ?? new ChainState();
     this.persistDir = opts.persistDir ?? process.env.STREAM_PERSIST_DIR;
     this.retentionMs = opts.retentionMs ?? Number(process.env.STREAM_RETENTION_MS ?? 3_600_000);
     this.log = opts.log;
@@ -174,7 +180,7 @@ export class StreamHub {
   /** Binary-API convenience: object params. */
   subscribe(type: StreamType, params: any, sub: Subscriber, from: { fromSeq?: number; fromSlot?: number } = {}) {
     if (!STREAM_TYPES.includes(type)) throw INVALID_PARAMS(`unknown stream type: ${type}`);
-    return this.subscribeRaw(type, toRawParams(type, params ?? {}), sub, from);
+    return this.subscribeRaw(type, toRawParams(type, params ?? {}, this.chain.defaultCommitment), sub, from);
   }
 
   /**
@@ -185,6 +191,8 @@ export class StreamHub {
     if (!STREAM_TYPES.includes(type)) throw INVALID_PARAMS(`unknown stream type: ${type}`);
     if (!Array.isArray(raw)) throw INVALID_PARAMS("params must be an array");
     SPEC[type].validate(raw);
+    // optional confirmed->finalized rewrite also merges equivalent topics under Alpenglow
+    raw = raw.map((x) => x && typeof x === "object" && !Array.isArray(x) && typeof x.commitment === "string" ? { ...x, commitment: this.chain.mapCommitment(x.commitment) } : x);
     const key = `${type}:${JSON.stringify(raw)}`;
     let t = this.topics.get(key);
     if (!t) { t = new Topic(key, type, raw, this); this.topics.set(key, t); t.start(this.upstream); }

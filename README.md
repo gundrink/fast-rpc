@@ -116,12 +116,59 @@ await unsub();
 - **Priority fee** is a heuristic. For v0 transactions only static keys are decoded (lookup-table keys aren't resolved).
 - **gPA limits**: results above `GPA_MAX_RESULTS` return `-32005`. There is no `getProgramAccountsV2` pagination. The public mainnet RPC also blocks gPA for large programs (`403`, passed through).
 - **Limits/credits** are per process and in memory. Nothing is shared across instances and nothing is billed.
-- **Commitment**: binary streams default to `confirmed`. WS clients pass their own config through unchanged.
+- **Commitment**: binary/SSE streams default to `finalized` once Alpenglow is detected (else `confirmed`). WS clients pass their own config through unchanged unless `ALPENGLOW_CONFIRMED_AS_FINALIZED=1`.
+
+## Alpenglow readiness
+
+Facts, all taken from the official page **https://solana.com/upgrades/alpenglow** (updated Oct 2026) unless noted otherwise:
+- **Status:**
+  - Votor (the voting protocol) is **live on mainnet** since epoch 1064 (2026-10-21, ~13:36 UTC). It shipped in Agave 4.3; mainnet runs v4.3.2.
+  - The Alpenglow genesis block is slot 459,652,999, and Alpenglow consensus runs from slot 459,653,000.
+  - Devnet activated in epoch 1167 (2026-09-25). The page also says Alpenglow is live on testnet, but gives no testnet date.
+  - Rotor (the Turbine replacement) is planned and **not yet scheduled**.
+  - Feature gate: `A1pengvuM6JEcyNuTnMqepBKhwHE3N6PmUrdATGawhJS`.
+- **Timing:**
+  - Finality is ~150ms (previously ~12.8s, the 32-slot lockout). This is "an expectation, not a constant".
+  - Slot time was cut **separately** from 400ms to 200ms, in four stages completed in Oct 2026.
+- **Commitment:**
+  - `processed`, `confirmed` and `finalized` all still work.
+  - `confirmed` and `finalized` now describe the same state.
+  - New code should use `finalized`. `confirmed` will be deprecated and removed in a later release.
+  - There is no new commitment level.
+- **Votes:** vote transactions are no longer in blocks, so vote filtering is a no-op.
+- **Detection:** call the new `getAgGenesisCert` RPC (Agave 4.3+, no params, reads the finalized bank).
+  - `null` means TowerBFT; an object means the cluster has migrated (`block.slot` is the genesis slot).
+  - `-32601` means the node is pre-4.3 and should be treated as unknown, not as TowerBFT.
+  - The page says to gate behaviour on this call, not on a date or version string.
+  - Verified live on 2026-10-23: mainnet returned `block.slot = 459652999`, and `getVersion` returned `solana-core 4.3.2`.
+- **JSON-RPC / WebSocket are unchanged.** `bank_id` and multiple banks per slot exist only on Geyser/gRPC. fast-rpc relays standard pubsub, so it needs no `bank_id` handling.
+- PoH ticks are gone, and `Clock.unix_timestamp` is now set by the leader. Neither affects this proxy.
+- SIMDs listed by the page: 0326 (consensus), 0337 (fast leader handover markers), 0357 (VAT), 0384 (migration), 0387 (BLS pubkeys). I could not retrieve the SIMD-0326 text (GitHub fetch returned empty), so nothing here relies on SIMD-specific details.
+
+What fast-rpc does (`src/chain.ts`, `GET /v0/chain`):
+- **Slot rate is observed, not assumed.**
+  - The initial guess is `SLOT_MS` (default 200). It is refined by an EWMA over slot notifications; gaps and outages are ignored.
+  - With `CHAIN_TRACK_SLOTS=1`, an internal `slotSubscribe` keeps the estimate fresh. Otherwise any client slot stream feeds it.
+  - Cache TTLs for slot-bound reads use N observed slots instead of fixed 400/1000ms: 1 slot for getSlot/BlockHeight/LatestBlockhash/AccountInfo/MultipleAccounts, 2 slots for balances, signatures, token accounts, epoch info and prioritization fees.
+  - `transactionSubscribe` / webhook `getTransaction` retry spacing is 2 observed slots (min 100ms) instead of a fixed 400ms.
+- **Detection:** `getAgGenesisCert` runs at start-up and every 10 min (`CHAIN_DETECT=0` disables it). The method is also proxied.
+- **Default commitment:** internal subscriptions (binary/SSE streams without a commitment, `transactionSubscribe`, webhooks) use `finalized` once Alpenglow is detected, otherwise `confirmed`. Override with `DEFAULT_COMMITMENT`.
+- **Optional `ALPENGLOW_CONFIRMED_AS_FINALIZED=1`:** client `confirmed` is rewritten to `finalized` (HTTP reads and WS/stream topics, which also merges duplicate upstream subscriptions). It is applied **only** while Alpenglow is detected, and is off by default.
+- **Vote heuristic:** the Vote-program log scan in `transactionSubscribe` is skipped under Alpenglow. The account-key check stays, as a harmless no-op.
+- **Priority fee:** `options.lookbackSlots` (1..150, as in Helius) is a window measured in **slots**. 150 slots is now ~30s rather than ~60s.
+
+Unknowns (not implemented):
+- There is no documented RPC field that exposes certificates. They are available only via Geyser `notify_block_footer`.
+- Exact `rootSubscribe`/`slotSubscribe` semantics under Votor aren't specified beyond "JSON-RPC and WebSocket are unchanged", so fast-rpc passes them through as-is.
+- No removal date has been given for `confirmed`.
+- Rotor has no date.
+
+`npm run live:alpenglow` checks detection and the observed slot rate against mainnet (1 RPC call plus 1 WS subscription). A sample run gave `{"consensus":"alpenglow","genesisSlot":459652999,"slotMs":269.1,...}`; the public node delivers slot notifications in bursts, so the observed figure sits above the nominal 200ms.
 
 ## Run
 ```
 npm install
-npm test               # 59 offline tests (mock Solana HTTP+WS, mock send/DAS, local webhook receiver), ~10s
+npm test               # 66 offline tests (incl. Alpenglow timing mock) (mock Solana HTTP+WS, mock send/DAS, local webhook receiver), ~10s
 npm run typecheck
 npm run serve          # :7070 → binary + HTTP JSON-RPC + WS pubsub + SSE
 npm run demo           # binary client RPC calls against mainnet
@@ -133,7 +180,7 @@ curl -X POST 'localhost:7070/?api-key=KEY' -d '{"jsonrpc":"2.0","id":1,"method":
 curl -N 'localhost:7070/stream?type=slot'
 wscat -c 'ws://localhost:7070/?api-key=KEY' -x '{"jsonrpc":"2.0","id":1,"method":"slotSubscribe"}'
 ```
-Env: `SOLANA_RPC_URL`, `SOLANA_WS_URL` (defaults mainnet-beta public), `SOLANA_TIMEOUT_MS` (10000), `API_KEYS`, `PORT` (7070), `HOST` (127.0.0.1), `STREAM_RING` (2000), `STREAM_SOFT_LIMIT`, `STREAM_HARD_LIMIT`, `STREAM_SLOW_TIMEOUT_MS`, `MAX_FRAME_BYTES`, `GPA_MAX_RESULTS` (10000), `SEND_RPC_URLS`, `DAS_RPC_URL`, `WEBHOOKS_FILE`, `STREAM_PERSIST_DIR`, `STREAM_RETENTION_MS` (3600000), `KEY_LIMITS`, `DEFAULT_RPS`, `DEFAULT_CREDITS`, `TX_FILTER_MAX_ACCOUNTS` (100).
+Env: `SOLANA_RPC_URL`, `SOLANA_WS_URL` (defaults mainnet-beta public), `SOLANA_TIMEOUT_MS` (10000), `API_KEYS`, `PORT` (7070), `HOST` (127.0.0.1), `STREAM_RING` (2000), `STREAM_SOFT_LIMIT`, `STREAM_HARD_LIMIT`, `STREAM_SLOW_TIMEOUT_MS`, `MAX_FRAME_BYTES`, `GPA_MAX_RESULTS` (10000), `SEND_RPC_URLS`, `DAS_RPC_URL`, `WEBHOOKS_FILE`, `STREAM_PERSIST_DIR`, `STREAM_RETENTION_MS` (3600000), `KEY_LIMITS`, `DEFAULT_RPS`, `DEFAULT_CREDITS`, `TX_FILTER_MAX_ACCOUNTS` (100), `SLOT_MS` (200), `CHAIN_TRACK_SLOTS`, `CHAIN_DETECT`, `DEFAULT_COMMITMENT`, `ALPENGLOW_CONFIRMED_AS_FINALIZED`.
 The public mainnet endpoint is rate-limited; point `SOLANA_RPC_URL`/`SOLANA_WS_URL` at your own node or a provider for real load.
 
 ## Layout
@@ -149,6 +196,7 @@ src/das.ts          DAS proxy + on-chain getAsset/getAssetsByOwner fallback (Met
 src/txstream.ts     TxWatcher: transactionSubscribe engine (logs topics + getTransaction + filters)
 src/webhooks.ts     WebhookManager: REST CRUD, JSON persistence, delivery w/ retries
 src/limits.ts       per-key token bucket + credits
+src/chain.ts        ChainState: observed slot rate, Alpenglow detection, commitment defaults
 src/app.ts          createFastRpc() wiring
 test/*.test.ts      node:test suites + mock Solana node + unpluggable TCP proxy
 ```

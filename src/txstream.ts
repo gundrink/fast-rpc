@@ -5,7 +5,7 @@ import { decodeTransaction, isPubkey } from "./codec.js";
 
 export const VOTE_PROGRAM = "Vote111111111111111111111111111111111111111";
 export interface TxFilter { accountInclude?: string[]; accountExclude?: string[]; accountRequired?: string[]; vote?: boolean; failed?: boolean; signature?: string }
-export interface TxOptions { commitment?: "confirmed" | "finalized"; encoding?: "json" | "jsonParsed" | "base64" | "base58"; transactionDetails?: "full" | "signatures" | "accounts" | "none"; showRewards?: boolean; maxSupportedTransactionVersion?: number }
+export interface TxOptions { commitment?: "processed" | "confirmed" | "finalized"; encoding?: "json" | "jsonParsed" | "base64" | "base58"; transactionDetails?: "full" | "signatures" | "accounts" | "none"; showRewards?: boolean; maxSupportedTransactionVersion?: number }
 export type GetTx = (sig: string, cfg: any) => Promise<any>;
 export const MAX_FILTER_ACCOUNTS = Number(process.env.TX_FILTER_MAX_ACCOUNTS ?? 100);
 
@@ -52,10 +52,10 @@ export class TxWatcher {
   private stopped = false;
   stats = { matched: 0, filtered: 0, fetchFailed: 0, dropped: 0 };
   constructor(private hub: StreamHub, private getTx: GetTx, private filter: TxFilter, private opts: TxOptions, private onTx: (e: TxEvent) => void,
-    private cfg = { concurrency: 8, maxQueue: 2000, retries: 4, retryMs: 400 }) {
+    private cfg: { concurrency: number; maxQueue: number; retries: number; retryMs?: number } = { concurrency: 8, maxQueue: 2000, retries: 4 }) {
     const watch = new Set([...(filter.accountInclude ?? []), ...(filter.accountRequired ?? [])]);
     for (const a of watch) {
-      const r = hub.subscribe("logs", { mentions: a, commitment: opts.commitment ?? "confirmed" }, { deliver: (e: Entry) => this.onLog(e) });
+      const r = hub.subscribe("logs", { mentions: a, commitment: opts.commitment ?? hub.chain.defaultCommitment }, { deliver: (e: Entry) => this.onLog(e) });
       this.detach.push(r.detach);
     }
   }
@@ -64,7 +64,8 @@ export class TxWatcher {
     if (!sig || this.seen.has(sig)) return;
     this.seen.add(sig); this.seenQ.push(sig); if (this.seenQ.length > 20_000) this.seen.delete(this.seenQ.shift()!);
     if (v.err && this.filter.failed === false) { this.stats.filtered++; return; }
-    if (this.filter.vote !== true && (v.logs ?? []).some((l: string) => l.includes(VOTE_PROGRAM))) { this.stats.filtered++; return; }
+    // TowerBFT-only heuristic: under Alpenglow votes are not transactions, so skip the scan entirely
+    if (this.filter.vote !== true && !this.hub.chain.alpenglow && (v.logs ?? []).some((l: string) => l.includes(VOTE_PROGRAM))) { this.stats.filtered++; return; }
     if (this.queue.length >= this.cfg.maxQueue) { this.queue.shift(); this.stats.dropped++; }
     this.queue.push({ sig, slot: e.slot });
     this.pump();
@@ -82,11 +83,12 @@ export class TxWatcher {
     }
   }
   private async fetch(sig: string) {
-    const cfg = { encoding: this.opts.encoding ?? "json", commitment: this.opts.commitment ?? "confirmed", maxSupportedTransactionVersion: this.opts.maxSupportedTransactionVersion ?? 0 };
+    const cfg = { encoding: this.opts.encoding ?? "json", commitment: this.opts.commitment ?? this.hub.chain.defaultCommitment, maxSupportedTransactionVersion: this.opts.maxSupportedTransactionVersion ?? 0 };
     for (let i = 0; i <= this.cfg.retries; i++) {
       try { const r = await this.getTx(sig, cfg); if (r) return r; } catch {}
       if (this.stopped) return null;
-      await new Promise((res) => setTimeout(res, this.cfg.retryMs * (i + 1)));
+      // retry spacing follows the observed slot rate (tx becomes visible ~1-2 slots later), not a fixed 400ms
+      await new Promise((res) => setTimeout(res, (this.cfg.retryMs ?? this.hub.chain.slots(2, 100)) * (i + 1)));
     }
     return null;
   }

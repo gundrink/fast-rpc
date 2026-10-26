@@ -26,7 +26,7 @@ async function rest(method: string, path: string, body?: any) {
 }
 const must = (c: any, m: string) => { if (!c) throw new Error(m); };
 
-// note: the USDC mint (EPjF...) reads as null on all 3 public endpoints at test time, so BONK is the SPL probe
+// SPL probe mint (BONK). Earlier runs used a mistyped USDC address; real USDC is EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
 const WSOL = "So11111111111111111111111111111111111111112", USDC = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263";
 const TOKEN = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", VOTE = "Vote111111111111111111111111111111111111111";
 const STAKE_POOL_OWNER = "GThUX1Atko4tqhN2NaiTazWSeFWMuiUvfFnyJyUghFMJ"; // well-known wallet (Raydium authority-ish); only read

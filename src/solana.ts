@@ -1,6 +1,7 @@
 // Read-only Solana JSON-RPC upstream: timeout, short TTL cache, in-flight dedupe, param limits.
 import { RpcError, INVALID_PARAMS } from "./errors.js";
 import { decodeTransaction, b58decode, MAX_TX_VERSION } from "./codec.js";
+import { createTokenLargest } from "./largest.js";
 import { createDas } from "./das.js";
 import { getTransactionsForAddress } from "./history.js";
 import { ChainState } from "./chain.js";
@@ -151,6 +152,7 @@ export function createSolanaApi(opts: SolanaApiOptions = {}) {
   const tpu = createTpuSender(up, { transport: tpuTransport });
   const sender = createSender({ read: up, senders, chain, jitoSend: (t, c) => jito.sendTransaction(t, c), jitoCheck: (t, c) => jito.checkTip(t, c), tpu });
   let fb: ReturnType<typeof createFundedBy> | undefined;
+  let tokenLargest: ReturnType<typeof createTokenLargest> | undefined;
   const api = {
     ...das,
     /** Helius funded-by equivalent: params [address, {hops: 1..3 (default 2)}] */
@@ -166,6 +168,12 @@ export function createSolanaApi(opts: SolanaApiOptions = {}) {
       if (!(tpuTransport instanceof SidecarTransport)) throw new RpcError(-32601, "getTpuHandshake needs TPU_SIDECAR_URL");
       const l = await tpu.leaderAddrs(); const r = await tpuTransport.handshake(l.map((x) => x.addr));
       return l.map((x, i) => ({ ...x, ...r[i] }));
+    },
+    /** read-only: is direct-TPU configured, and is the sidecar allowed to forward (TPU_SIDECAR_ALLOW_SEND)? */
+    getTpuStatus: async () => {
+      if (!(tpuTransport instanceof SidecarTransport)) return { enabled: false, reason: "TPU_SIDECAR_URL not set" };
+      const h: any = await tpuTransport.health().catch((e: any) => ({ ok: false, error: String(e?.message ?? e) }));
+      return { enabled: !!h.ok, allowSend: !!h.allowSend, identity: h.identity ?? null, fanout: Number(process.env.TPU_FANOUT ?? 4) };
     },
     getUpstreamStats: () => raced?.stats() ?? [{ url: (opts.url ?? upstreamUrl).replace(/([?&]api-key=)[^&]+/, "$1***"), single: true }],
     getClusterNodes: pass("getClusterNodes", 30_000),
@@ -215,7 +223,17 @@ export function createSolanaApi(opts: SolanaApiOptions = {}) {
     getSlotLeader: pass("getSlotLeader", 0),
     getStakeMinimumDelegation: pass("getStakeMinimumDelegation", 60_000),
     getSupply: pass("getSupply", 30_000),
-    getTokenLargestAccounts: pass("getTokenLargestAccounts", 10_000, needKey("getTokenLargestAccounts")),
+    /** native first (short budget); public RPCs block it, so fall back to a streamed getProgramAccounts top-20 */
+    getTokenLargestAccounts: async (...a: any[]) => {
+      const p = clean(a); needKey("getTokenLargestAccounts")(p);
+      if (process.env.TOKEN_LARGEST_NATIVE !== "0") {
+        try {
+          const v = await Promise.race([up("getTokenLargestAccounts", p, 10_000), new Promise((_, rej) => setTimeout(() => rej(new Error("native timeout")), Number(process.env.TOKEN_LARGEST_NATIVE_MS ?? 1500)))]);
+          return v;
+        } catch (e: any) { if (e instanceof RpcError && e.code === -32602 && !/blocked|token|disabled/i.test(e.message)) throw e; }
+      }
+      return (tokenLargest ??= createTokenLargest((m, q) => up(m, q, 0), { urls: urls.length ? urls : [opts.url ?? upstreamUrl], fetcher: opts.fetcher }))(p[0], p[1] ?? {});
+    },
     getTokenAccountsByDelegate: pass("getTokenAccountsByDelegate", slotTtl(2), needKey("getTokenAccountsByDelegate")),
     getTransactionCount: pass("getTransactionCount", 0),
     getVoteAccounts: pass("getVoteAccounts", 10_000),

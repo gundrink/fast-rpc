@@ -218,7 +218,7 @@ test("tpu-sidecar transport: handshake + send through a MOCK sidecar; wired by t
   const got: any[] = [];
   const srv = http.createServer((req, res) => { let b = ""; req.on("data", (c) => (b += c)); req.on("end", () => {
     const j = b ? JSON.parse(b) : {}; got.push({ path: req.url, j }); res.writeHead(200, { "content-type": "application/json" });
-    if (req.url === "/health") return res.end('{"ok":true}');
+    if (req.url === "/health") return res.end('{"ok":true,"allowSend":true,"identity":"ID"}');
     res.end(JSON.stringify(j.addrs.map((a: string) => ({ addr: a, ok: a !== "9.9.9.9:1", ms: 1, reused: false, ...(a === "9.9.9.9:1" ? { error: "timeout" } : {}) }))));
   }); });
   await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
@@ -237,6 +237,7 @@ test("tpu-sidecar transport: handshake + send through a MOCK sidecar; wired by t
       const r = await (ap.api as any).sendTransactionWithRetry(signedTx().b64, {});
       assert.equal(r.paths.tpu, 1); assert.equal(got.filter((g) => g.path === "/send").length, 3);
       assert.equal((await (ap.api as any).getTpuHandshake())[0].ok, true);
+      assert.deepEqual(await (ap.api as any).getTpuStatus(), { enabled: true, allowSend: true, identity: "ID", fanout: 4 });
     } finally { await ap.close(); await m.close(); }
   } finally { srv.close(); }
 });

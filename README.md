@@ -276,3 +276,53 @@ src/enhanced.ts     parseEnhanced: TRANSFER / SWAP / NFT_SALE / cNFT enhanced tx
 src/app.ts          createFastRpc() wiring
 test/*.test.ts      node:test suites + mock Solana node + unpluggable TCP proxy
 ```
+
+## ProLaunch upgrade (no paid services)
+
+All of this runs on free/public infrastructure. Nothing here signs or creates transactions; the send paths only forward transactions that are already signed. Tests use mocks only.
+
+### Funded-by (Helius `funded-by` equivalent)
+- `GET /v0/addresses/{address}/funded-by?hops=1..3` (alias `GET /v1/wallet/{address}/funded-by`). Default is 2 hops, max is 3.
+- JSON-RPC: `getFundedBy` with params `[address, { hops }]`.
+- Response: `funder, funderName, funderType, mint, symbol, amount, amountRaw, decimals, signature, timestamp, date, slot, explorerUrl` plus `hops[]`, `complete`, `truncated`, and `stoppedAt` (`labeled:cex|mixer|bridge|program`, `noIncomingSol`, `truncated`, `timeout`, `upstreamError`).
+- How it works: it pages `getSignaturesForAddress`, keeping pagination shallow (`FUNDED_BY_MAX_PAGES`, default 3 × 1000 signatures), and scans the oldest transactions for a System `transfer`, `createAccount` or `transferWithSeed` into the address. Inner instructions count too.
+- If the oldest transaction isn't reached, you get the earliest incoming transfer it **did** see, with `complete:false, truncated:true`.
+- Labels: `data/labels.json` (`LABELS_FILE`) with `{address,name,type,source}`. It **ships empty**. Add only addresses you have verified from a cited source. The walk stops at a labeled address.
+- Cache: in-memory with a TTL. `FUNDED_BY_CACHE_FILE` persists it to disk.
+
+### Auth and rate limits (auth is OFF by default)
+- `API_KEYS=a,b` or `API_KEYS_FILE=data/keys.json` (`{"keys":[{"key","project","rps","burst","credits"}]}`). Send the key as `?api-key=` or in the `x-api-key` header.
+- Per-key token bucket and credits come from `KEY_LIMITS` / `DEFAULT_RPS` / `DEFAULT_CREDITS`, or from the per-key values in the keys file.
+- Per-IP limit: `IP_LIMIT` requests per `IP_WINDOW_MS`. It is a sliding window in memory. With `REDIS_URL` set it becomes a fixed window shared across replicas, and it falls back to memory if Redis is down. `TRUST_PROXY=1` makes it use `X-Forwarded-For`.
+- The default bind is `127.0.0.1`. `examples/serve.ts` refuses to bind a non-local address with auth off unless `ALLOW_PUBLIC_NO_AUTH=1` is set.
+
+### Faster reads and sends
+- `SOLANA_RPC_URLS=url1,url2,...` races reads. It goes to the fastest healthy upstream by EWMA latency and hedges to the next one after `RACE_HEDGE_MS` (default 150). An upstream that errors or returns 429 is cooled down for 30s. Real answers such as -32602 are not retried elsewhere. `getUpstreamStats` shows the state.
+- Responses are cached with TTLs derived from the slot time. Node's built-in `fetch` (undici) pools keep-alive connections per origin.
+- `sendTransactionWithRetry(tx, {encoding, skipPreflight=true, jito, tpu, commitment, rebroadcastMs, timeoutMs})`:
+  - Each round sends the same signed tx to every send upstream (`SOLANA_RPC_URL` plus `SEND_RPC_URLS`), to Jito (`jito:true`, tip validated first), and to TPU (when a transport is configured).
+  - It polls `getSignatureStatuses` between rounds and stops on the target commitment, a tx error, blockhash expiry (`isBlockhashValid` → -32003) or timeout.
+  - Alpenglow-aware: the default target is `chain.defaultCommitment` (`finalized` once Alpenglow is detected, because confirmed equals finalized there), and the rebroadcast interval is 2 observed slots.
+- `getSmartFees({priorityLevel, accountKeys|transaction, tipPercentile})` returns `computeUnitPrice` plus a Jito tip suggestion from the public tip floor (`JITO_TIP_FLOOR_URL`), with a fallback to `JITO_MIN_TIP_LAMPORTS`.
+- `getTpuLeaders` resolves the next `TPU_FANOUT` leaders' `tpuQuic` addresses through `getSlot`, `getSlotLeaders` and `getClusterNodes`. Sending straight to TPU needs a QUIC transport (`api.tpuTransport`). Node has no built-in QUIC, so this path is **off** unless you plug one in.
+- New passthroughs: `getClusterNodes`, `getSlotLeaders`, `getLeaderSchedule`, `isBlockhashValid`.
+
+### Health and deploy
+- `GET /health` returns `ok`, `GET /healthz` returns JSON, and `GET /metrics` returns Prometheus text. `/metrics` requires a key when auth is on.
+- Config files: `Dockerfile`, `docker-compose.yml` (with Redis, bound to host-local only), `railway.json` (Dockerfile build, `/health` healthcheck; Railway supplies `PORT`, and `RAILWAY_ENVIRONMENT` makes the server bind `0.0.0.0`), `fly.toml`, and `.env.example`. **Nothing has been deployed.**
+- On Railway, set `API_KEYS`. Otherwise use only private networking and set `ALLOW_PUBLIC_NO_AUTH=1`.
+
+### Test
+```
+npm test                       # all tests, mocks only
+node --import tsx --test test/upgrade.test.ts
+npm run typecheck
+npx tsx examples/live-upgrade.ts   # read-only mainnet: TPU leaders + funded-by (public RPC may return 429)
+```
+
+### Limits without your own node or paid infra
+- **Unstaked sending:** under SWQoS, leaders deprioritize unstaked TPU and RPC forwarding, so landing speed under load is far below a staked connection. Jito's public engine helps only when you pay a tip.
+- **Public RPC:** strict rate limits, especially on `getTransaction` and `getSignaturesForAddress` (429 is common), and no archival guarantee. Funded-by on old or busy wallets therefore often comes back `truncated:true`.
+- **No Geyser:** without a Yellowstone endpoint, streaming uses standard WebSocket pubsub, with higher latency and no full-block or account firehose.
+- **No QUIC in Node 20/24:** stable Node has no built-in QUIC, so direct TPU needs an external QUIC lib or sidecar. Railway also has no public inbound UDP; outbound QUIC to leaders is untested there.
+- **Labels:** the label list is empty until you add verified entries, so CEX/mixer detection only works for addresses you add.

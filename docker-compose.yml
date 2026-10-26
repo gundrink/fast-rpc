@@ -1,0 +1,14 @@
+services:
+  fast-rpc:
+    build: .
+    env_file: .env
+    environment:
+      HOST: 0.0.0.0
+      REDIS_URL: redis://redis:6379
+    ports: ["127.0.0.1:7070:7070"]   # host-local only
+    volumes: ["./data:/app/data"]
+    depends_on: [redis]
+    restart: unless-stopped
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped

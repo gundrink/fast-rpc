@@ -1,6 +1,7 @@
 import { parseTransactions, addressTransactions, HttpError } from "./history.js";
 import net from "node:net";
 import http from "node:http";
+import { IpLimiter, loadKeys } from "./auth.js";
 import { WebSocketServer, WebSocket } from "ws";
 import { encode, FrameDecoder, MsgType } from "./protocol.js";
 import { RpcError } from "./errors.js";
@@ -28,6 +29,10 @@ export interface ServerOptions {
   wsPingMs?: number;
   /** per-key rate limits / credits (default: Limiter.fromEnv(): KEY_LIMITS, DEFAULT_RPS, DEFAULT_CREDITS) */
   limiter?: Limiter;
+  /** per-IP limit (default IpLimiter(): IP_LIMIT per IP_WINDOW_MS, REDIS_URL optional); off when IP_LIMIT unset */
+  ipLimiter?: IpLimiter;
+  /** trust X-Forwarded-For (TRUST_PROXY=1, e.g. on Railway) */
+  trustProxy?: boolean;
   log?: (...a: any[]) => void;
 }
 
@@ -61,15 +66,18 @@ export class RpcServer {
   stats = { dropped: 0, slowDisconnects: 0, badFrames: 0 };
 
   constructor(opts: ServerOptions = {}) {
+    const fileKeys = opts.apiKeys ? { keys: [], limits: {} } : loadKeys();
     this.o = {
       softLimit: opts.softLimit ?? Number(process.env.STREAM_SOFT_LIMIT ?? 1 << 20),
       hardLimit: opts.hardLimit ?? Number(process.env.STREAM_HARD_LIMIT ?? 8 << 20),
       slowTimeoutMs: opts.slowTimeoutMs ?? Number(process.env.STREAM_SLOW_TIMEOUT_MS ?? 10_000),
       maxFrame: opts.maxFrame ?? Number(process.env.MAX_FRAME_BYTES ?? 16 << 20),
       maxBodyBytes: opts.maxBodyBytes ?? 5 << 20,
-      apiKeys: opts.apiKeys ?? (process.env.API_KEYS ? process.env.API_KEYS.split(",").map((s) => s.trim()).filter(Boolean) : []),
+      apiKeys: opts.apiKeys ?? [...(process.env.API_KEYS ? process.env.API_KEYS.split(",").map((s) => s.trim()).filter(Boolean) : []), ...fileKeys.keys],
       wsPingMs: opts.wsPingMs ?? 30_000,
-      limiter: opts.limiter ?? Limiter.fromEnv(),
+      limiter: opts.limiter ?? Limiter.fromEnv(fileKeys.limits),
+      ipLimiter: opts.ipLimiter ?? new IpLimiter(),
+      trustProxy: opts.trustProxy ?? process.env.TRUST_PROXY === "1",
       log: opts.log ?? (() => {}),
     };
     this.http = http.createServer({ maxHeaderSize: 16 << 10 }, (req, res) => this.onHttp(req, res).catch((e) => {
@@ -80,8 +88,8 @@ export class RpcServer {
     this.http.keepAliveTimeout = 65_000;
     this.wss = new WebSocketServer({ noServer: true, maxPayload: 1 << 20 });
     this.http.on("upgrade", (req, sock, head) => {
-      if (!this.authorized(req.url)) { sock.end("HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n"); return; }
-      this.wss.handleUpgrade(req, sock as net.Socket, head, (ws) => this.onWs(ws, this.keyOf(req.url)));
+      if (!this.authorized(req.url, req.headers["x-api-key"])) { sock.end("HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n"); return; }
+      this.wss.handleUpgrade(req, sock as net.Socket, head, (ws) => this.onWs(ws, this.keyOf(req.url, req.headers["x-api-key"])));
     });
     this.http.on("clientError", (_e, sock) => { if (sock.writable) sock.end("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"); else sock.destroy(); });
   }
@@ -100,19 +108,25 @@ export class RpcServer {
     return new Promise((r, j) => { this.tcp.once("error", j); this.tcp.listen(port, host, () => r((this.tcp.address() as net.AddressInfo).port)); });
   }
   async close() {
+    this.o.ipLimiter.close();
     for (const c of this.wss.clients) c.terminate();
     for (const s of this.conns) s.destroy();
     await new Promise<void>((r) => this.tcp.close(() => r()));
   }
 
-  private authorized(url = "/") {
+  private authorized(url = "/", hk?: string | string[]) {
     if (!this.o.apiKeys.length) return true;
-    const k = new URL(url, "http://x").searchParams.get("api-key");
+    const k = new URL(url, "http://x").searchParams.get("api-key") || (typeof hk === "string" ? hk : undefined);
     return !!k && this.o.apiKeys.includes(k);
   }
 
   /** auth off (no API_KEYS): ?api-key= is accepted but ignored, everyone shares the "anonymous" bucket */
-  private keyOf(url = "/") { return this.o.apiKeys.length ? new URL(url, "http://x").searchParams.get("api-key") || "anonymous" : "anonymous"; }
+  private keyOf(url = "/", hk?: string | string[]) { return this.o.apiKeys.length ? new URL(url, "http://x").searchParams.get("api-key") || (typeof hk === "string" ? hk : "") || "anonymous" : "anonymous"; }
+  private ipOf(req: http.IncomingMessage) {
+    const f = this.o.trustProxy ? String(req.headers["x-forwarded-for"] ?? "").split(",")[0].trim() : "";
+    return f || req.socket.remoteAddress || "unknown";
+  }
+  metrics = { http: 0, ipLimited: 0, startedAt: Date.now() };
 
   private async dispatch(method: string, params: any, key = "anonymous") {
     const fn = this.handlers.get(method);
@@ -248,9 +262,24 @@ export class RpcServer {
       res.writeHead(204, { "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS", "Access-Control-Allow-Headers": "content-type, solana-client" });
       return void res.end();
     }
+    this.metrics.http++;
     if (req.method === "GET" && url.pathname === "/health") { res.writeHead(200, { "content-type": "text/plain" }); return void res.end("ok"); }
-    if (!this.authorized(req.url)) return this.json(res, 401, rpcErr(null, -32001, "Unauthorized: invalid or missing api-key"));
-    const key = this.keyOf(req.url);
+    if (req.method === "GET" && url.pathname === "/healthz") return this.json(res, 200, { ok: true, uptimeS: Math.round((Date.now() - this.metrics.startedAt) / 1000), chain: this.chain?.status()?.consensus ?? "unknown" });
+    if (!(await this.o.ipLimiter.allow(this.ipOf(req)))) { this.metrics.ipLimited++; return this.json(res, 429, rpcErr(null, -32429, "Too many requests from this IP")); }
+    if (!this.authorized(req.url, req.headers["x-api-key"])) return this.json(res, 401, rpcErr(null, -32001, "Unauthorized: invalid or missing api-key"));
+    const key = this.keyOf(req.url, req.headers["x-api-key"]);
+    if (req.method === "GET" && url.pathname === "/metrics") return this.metricsOut(res);
+    const fb = /^\/(?:v0\/addresses|v1\/wallet)\/([^/]+)\/funded-by$/.exec(url.pathname);
+    if (req.method === "GET" && fb) {
+      const fn = this.handlers.get("getFundedBy"); if (!fn) return this.json(res, 404, { error: "funded-by not enabled" });
+      try {
+        this.o.limiter.take(key, "getFundedBy");
+        const hops = url.searchParams.get("hops"); return this.json(res, 200, await fn(decodeURIComponent(fb[1]), { hops: hops == null ? undefined : Number(hops) }));
+      } catch (e: any) {
+        if (e instanceof RpcError) return this.json(res, e.code === -32429 ? 429 : e.code === -32602 ? 400 : 502, { error: e.message });
+        return this.json(res, 500, { error: String(e?.message ?? e) });
+      }
+    }
     if (req.method === "GET" && url.pathname === "/stream") {
       try { this.o.limiter.take(key, "subscribe"); } catch (e: any) { return this.json(res, 429, rpcErr(null, e.code, e.message)); }
       return this.sse(req, res, url);
@@ -317,6 +346,12 @@ export class RpcServer {
       if (e instanceof RpcError && e.code === -32429) return this.json(res, 429, { error: e.message });
       return this.json(res, 500, { error: String(e?.message ?? e) });
     }
+  }
+
+  private metricsOut(res: http.ServerResponse) {
+    const m = { ...this.metrics, ...this.stats, wsClients: this.wss.clients.size, tcpConns: this.conns.size, rssBytes: process.memoryUsage().rss };
+    const lines = Object.entries(m).filter(([, v]) => typeof v === "number").map(([k, v]) => `fastrpc_${k.replace(/[A-Z]/g, (c) => "_" + c.toLowerCase())} ${v}`);
+    res.writeHead(200, { "content-type": "text/plain; version=0.0.4" }); res.end(lines.join("\n") + "\n");
   }
 
   private json(res: http.ServerResponse, status: number, body: any) {

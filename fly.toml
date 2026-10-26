@@ -1,0 +1,19 @@
+# Optional alternative to Railway. Not deployed.
+app = "fast-rpc"
+primary_region = "sin"
+[build]
+  dockerfile = "Dockerfile"
+[env]
+  HOST = "0.0.0.0"
+  PORT = "7070"
+  TRUST_PROXY = "1"
+[http_service]
+  internal_port = 7070
+  force_https = true
+  auto_stop_machines = "off"
+  min_machines_running = 1
+  [[http_service.checks]]
+    interval = "15s"
+    timeout = "3s"
+    method = "GET"
+    path = "/health"

@@ -5,6 +5,10 @@ import { createDas } from "./das.js";
 import { getTransactionsForAddress } from "./history.js";
 import { ChainState } from "./chain.js";
 import { createJito, type JitoOptions } from "./jito.js";
+import { createRacedUpstream, type RaceOptions } from "./race.js";
+import { createFundedBy, type FundedByOptions } from "./fundedby.js";
+import { createSender, smartFees } from "./sender.js";
+import { createTpuSender, type TpuTransport } from "./tpu.js";
 
 export const upstreamUrl = process.env.SOLANA_RPC_URL ?? "https://api.mainnet-beta.solana.com";
 export interface SolanaApiOptions {
@@ -19,6 +23,13 @@ export interface SolanaApiOptions {
   jito?: JitoOptions; jitoDualSend?: boolean;
   /** local compressed-NFT index (used when DAS_RPC_URL is unset) */
   cnft?: import("./bubblegum.js").CnftIndexer;
+  /** race reads across several (free/public) RPCs: SOLANA_RPC_URLS (comma list) */
+  urls?: string[]; race?: RaceOptions;
+  fundedBy?: FundedByOptions;
+  /** direct TPU-QUIC transport (Node has no built-in QUIC; plug one in). Mocked in tests. */
+  tpuTransport?: TpuTransport;
+  /** fetch used by getSmartFees for the Jito tip floor */
+  fetcher?: typeof fetch;
 }
 
 export function createUpstream(url = upstreamUrl, timeoutMs = Number(process.env.SOLANA_TIMEOUT_MS ?? 10_000)) {
@@ -62,7 +73,9 @@ const PRIORITY_LEVELS: Record<string, string> = {
 };
 
 export function createSolanaApi(opts: SolanaApiOptions = {}) {
-  const up = createUpstream(opts.url, opts.timeoutMs);
+  const urls = opts.urls ?? (process.env.SOLANA_RPC_URLS ? process.env.SOLANA_RPC_URLS.split(",").map((x) => x.trim()).filter(Boolean) : []);
+  const raced = urls.length > 1 ? createRacedUpstream(urls, { timeoutMs: opts.timeoutMs, ...opts.race }) : undefined;
+  const up = raced ?? createUpstream(opts.url ?? urls[0], opts.timeoutMs);
   const sendUrls = opts.sendUrls ?? (process.env.SEND_RPC_URLS ? process.env.SEND_RPC_URLS.split(",").map((x) => x.trim()).filter(Boolean) : []);
   const senders = [up, ...sendUrls.map((u) => createUpstream(u, opts.timeoutMs))];
   const dasUrl = opts.dasUrl ?? process.env.DAS_RPC_URL;
@@ -90,8 +103,24 @@ export function createSolanaApi(opts: SolanaApiOptions = {}) {
 
   const jito = createJito(opts.jito);
   const dual = opts.jitoDualSend ?? process.env.SEND_JITO === "1";
+  const tpu = createTpuSender(up, { transport: opts.tpuTransport });
+  const sender = createSender({ read: up, senders, chain, jitoSend: (t, c) => jito.sendTransaction(t, c), jitoCheck: (t, c) => jito.checkTip(t, c), tpu });
+  let fb: ReturnType<typeof createFundedBy> | undefined;
   const api = {
     ...das,
+    /** Helius funded-by equivalent: params [address, {hops: 1..3 (default 2)}] */
+    getFundedBy: (address: any, cfg: any = {}) => (fb ??= createFundedBy((m, p) => (api as any)[m](...p), opts.fundedBy)).fundedBy(address, cfg ?? {}),
+    /** multi-path rebroadcast until target commitment / blockhash expiry (user-signed tx only) */
+    sendTransactionWithRetry: (tx: any, cfg?: any) => { if (typeof tx === "string") checkTx("sendTransactionWithRetry", [tx, { encoding: cfg?.encoding ?? "base64" }]); return sender.sendWithRetry(tx, cfg ?? {}); },
+    /** priority fee (microlamports/CU) + Jito tip suggestion */
+    getSmartFees: (req: any = {}) => smartFees((r) => (api as any).getPriorityFeeEstimate(r), req ?? {}, undefined, opts.fetcher),
+    /** next leaders' TPU-QUIC addresses (read-only) */
+    getTpuLeaders: () => tpu.leaderAddrs(),
+    getUpstreamStats: () => raced?.stats() ?? [{ url: (opts.url ?? upstreamUrl).replace(/([?&]api-key=)[^&]+/, "$1***"), single: true }],
+    getClusterNodes: pass("getClusterNodes", 30_000),
+    getSlotLeaders: pass("getSlotLeaders", 0),
+    getLeaderSchedule: pass("getLeaderSchedule", 60_000),
+    isBlockhashValid: pass("isBlockhashValid", 0),
     sendBundle: (...a: any[]) => jito.sendBundle(a[0], a[1]),
     getBundleStatuses: (...a: any[]) => jito.getBundleStatuses(a[0]),
     getInflightBundleStatuses: (...a: any[]) => jito.getInflightBundleStatuses(a[0]),

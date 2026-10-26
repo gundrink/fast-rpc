@@ -4,3 +4,4 @@ export * from "./codec.js"; export * from "./das.js"; export * from "./txstream.
 export * from "./jito.js"; export * from "./geyser.js"; export * from "./bubblegum.js"; export * from "./enhanced.js";
 export * from "./txerror.js"; export * from "./recorder.js"; export * from "./offchain.js"; export * from "./collections.js";
 export * from "./history.js";
+export * from "./fundedby.js"; export * from "./auth.js"; export * from "./race.js"; export * from "./sender.js"; export * from "./tpu.js";

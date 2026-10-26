@@ -1,0 +1,4 @@
+{
+  "$schema": "Editable address labels for funded-by. type: cex | mixer | bridge | program | other. Add only addresses you have verified from a cited source.",
+  "labels": []
+}

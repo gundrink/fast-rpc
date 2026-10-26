@@ -185,3 +185,30 @@ test("health/metrics endpoints", async () => {
   const h = await (await fetch(`http://127.0.0.1:${port}/healthz`)).json(); assert.equal(h.ok, true);
   const m = await (await fetch(`http://127.0.0.1:${port}/metrics`)).text(); assert.match(m, /fastrpc_http \d+/);
 });
+
+test("upstream: 429 retried with Retry-After / exp backoff; racer fails over then backs off", async () => {
+  const http = await import("node:http"); let n = 0; const at: number[] = [];
+  const srv = http.createServer((req, res) => { req.resume(); req.on("end", () => { at.push(Date.now()); if (n++ < 2) { res.writeHead(429, { "retry-after": "0.1", "content-type": "text/plain" }); return res.end("Too Many Requests"); } res.writeHead(200, { "content-type": "application/json" }); res.end('{"jsonrpc":"2.0","id":1,"result":7}'); }); });
+  await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
+  const { createUpstream, backoffMs } = await import("../src/index.js");
+  const url = `http://127.0.0.1:${(srv.address() as net.AddressInfo).port}`;
+  assert.equal(await createUpstream(url, 2000, 3)("getSlot"), 7); assert.equal(n, 3); assert.ok(at[1] - at[0] >= 90, "honours Retry-After");
+  n = 0; await assert.rejects(createUpstream(url, 2000, 0)("getSlot"), (e: any) => e.code === 429);
+  assert.ok(backoffMs(3) >= 1500 && backoffMs(3) <= 2500); assert.equal(backoffMs(0, "2"), 2000);
+  let calls = 0;
+  const r = createRacedUpstream(["a", "b"], { hedgeMs: 1000, rounds: 2, make: () => (async () => { if (calls++ < 2) throw new RpcError(429, "Too many requests"); return "ok"; }) as any });
+  assert.equal(await r("getSlot"), "ok"); assert.equal(calls, 3);
+  srv.close();
+});
+
+test("priority fee: all-zero min-fee samples -> falls back to real CU prices from recent blocks", async () => {
+  const m = await startMockSolana(); const CB = "ComputeBudget111111111111111111111111111111";
+  m.responses.getRecentPrioritizationFees = () => Array.from({ length: 10 }, (_, i) => ({ slot: i, prioritizationFee: 0 }));
+  const cu = (p: number) => { const d = Buffer.alloc(9); d[0] = 3; d.writeBigUInt64LE(BigInt(p), 1); return b58encode(d); };
+  m.responses.getBlock = () => ({ transactions: [100, 2000, 50000, 7].map((p) => ({ transaction: { message: { accountKeys: [pk(), CB], instructions: [{ programIdIndex: 1, accounts: [], data: cu(p) }] } }, meta: { err: null } })) });
+  const ap = createFastRpc({ api: { url: m.httpUrl }, hub: { wsUrl: m.wsUrl }, webhooks: false, chain: { detect: false } });
+  try {
+    const r = await (ap.api as any).getPriorityFeeEstimate({ options: { includeAllPriorityFeeLevels: true, includeDetails: true } });
+    assert.equal(r.source, "recentBlocks"); assert.ok(r.samples >= 4); assert.equal(r.priorityFeeLevels.unsafeMax, 50000); assert.ok(r.priorityFeeLevels.medium > 0);
+  } finally { await ap.close(); await m.close(); }
+});

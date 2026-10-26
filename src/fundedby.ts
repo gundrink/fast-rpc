@@ -13,7 +13,7 @@ export interface FundedByOptions {
   /** pages of 1000 signatures per hop (default FUNDED_BY_MAX_PAGES or 3) */
   maxPages?: number; pageSize?: number;
   /** oldest-first txs inspected per hop looking for the funding transfer (default 20) */
-  maxTxScan?: number; timeoutMs?: number;
+  maxTxScan?: number; timeoutMs?: number; minLamports?: number;
 }
 const SYS = "11111111111111111111111111111111";
 const SOL_MINT = "So11111111111111111111111111111111111111112";
@@ -26,8 +26,20 @@ export function loadLabels(file?: string): Map<string, Label> {
   return m;
 }
 
+/** Fallback when no System instruction moved SOL in (e.g. program CPI paths we do not decode): addr's balance rose,
+ *  funder = account whose lamports dropped the most. */
+export function balanceDelta(tx: any, addr: string): { from: string; lamports: number; method: string } | null {
+  const msg = tx?.transaction?.message; if (!msg || tx.meta?.err || !tx.meta?.preBalances) return null;
+  const keys: string[] = [...(msg.accountKeys ?? []).map((k: any) => (typeof k === "string" ? k : k.pubkey)), ...(tx.meta.loadedAddresses?.writable ?? []), ...(tx.meta.loadedAddresses?.readonly ?? [])];
+  const i = keys.indexOf(addr); if (i < 0) return null;
+  const d = (j: number) => (tx.meta.postBalances[j] ?? 0) - (tx.meta.preBalances[j] ?? 0);
+  const gain = d(i); if (gain <= 0) return null;
+  let best = -1, drop = 0; for (let j = 0; j < keys.length; j++) if (j !== i && -d(j) > drop) { drop = -d(j); best = j; }
+  return best < 0 ? null : { from: keys[best], lamports: gain, method: "balanceDelta" };
+}
+
 /** Incoming SOL transfers to `addr` in a getTransaction(json) result: System transfer / createAccount / transferWithSeed (top-level + inner). */
-export function incomingSol(tx: any, addr: string): { from: string; lamports: number }[] {
+export function incomingSol(tx: any, addr: string): { from: string; lamports: number; method: string }[] {
   const msg = tx?.transaction?.message; if (!msg || tx.meta?.err) return [];
   const keys: string[] = [...(msg.accountKeys ?? []).map((k: any) => (typeof k === "string" ? k : k.pubkey)),
     ...(tx.meta?.loadedAddresses?.writable ?? []), ...(tx.meta?.loadedAddresses?.readonly ?? [])];
@@ -41,7 +53,7 @@ export function incomingSol(tx: any, addr: string): { from: string; lamports: nu
     const pick = (fi: number, ti: number) => { if (keys[a[ti]] === addr && keys[a[fi]] !== addr) out.push({ from: keys[a[fi]], lamports: Number(d.readBigUInt64LE(4)) }); };
     if (t === 0 || t === 2) pick(0, 1); else if (t === 11) pick(0, 2);
   }
-  return out;
+  return out.map((x) => ({ ...x, method: "system" as string }));
 }
 
 export function createFundedBy(call: Call, opts: FundedByOptions = {}) {
@@ -51,7 +63,9 @@ export function createFundedBy(call: Call, opts: FundedByOptions = {}) {
   const ttl = opts.cacheTtlMs ?? Number(process.env.FUNDED_BY_CACHE_TTL_MS ?? 3_600_000);
   const maxPages = opts.maxPages ?? Number(process.env.FUNDED_BY_MAX_PAGES ?? 3);
   const pageSize = opts.pageSize ?? 1000;
-  const maxTxScan = opts.maxTxScan ?? 20;
+  const maxTxScan = opts.maxTxScan ?? Number(process.env.FUNDED_BY_MAX_TX_SCAN ?? 40);
+  /** ignore dust (address-poisoning spam) below this many lamports (default 100000 = 0.0001 SOL) */
+  const minLamports = opts.minLamports ?? Number(process.env.FUNDED_BY_MIN_LAMPORTS ?? 100_000);
   const timeoutMs = opts.timeoutMs ?? Number(process.env.FUNDED_BY_TIMEOUT_MS ?? 30_000);
   const maxTxVersion = Number(process.env.FUNDED_BY_MAX_TX_VERSION ?? 1);
   const cache = new Map<string, { at: number; v: any }>();
@@ -74,7 +88,8 @@ export function createFundedBy(call: Call, opts: FundedByOptions = {}) {
       try { tx = await call("getTransaction", [s.signature, { encoding: "json", maxSupportedTransactionVersion: maxTxVersion, commitment: "finalized" }]); }
       catch (e: any) { if (e instanceof RpcError && e.code === -32015) continue; throw e; } // unsupported tx version: skip it
       if (!tx) continue;
-      const inc = incomingSol(tx, addr);
+      let inc: { from: string; lamports: number; method: string }[] = incomingSol(tx, addr).filter((x) => x.lamports >= minLamports);
+      if (!inc.length) { const b = balanceDelta(tx, addr); if (b && b.lamports >= minLamports && !incomingSol(tx, addr).length) inc = [b]; }
       if (inc.length) return { complete: reachedOldest, scanned: sigs.length, hit: { ...inc[0], signature: s.signature, slot: tx.slot ?? s.slot, timestamp: tx.blockTime ?? s.blockTime ?? null } };
     }
     return { complete: reachedOldest, scanned: sigs.length, hit: null };
@@ -100,7 +115,7 @@ export function createFundedBy(call: Call, opts: FundedByOptions = {}) {
         hop: h + 1, address: cur, funder: r.hit.from, funderName: l?.name ?? null, funderType: l?.type ?? null,
         mint: SOL_MINT, symbol: "SOL", amount: r.hit.lamports / 1e9, amountRaw: String(r.hit.lamports), decimals: 9,
         signature: r.hit.signature, slot: r.hit.slot, timestamp: r.hit.timestamp, date: r.hit.timestamp ? new Date(r.hit.timestamp * 1000).toISOString() : null,
-        explorerUrl: `https://solscan.io/tx/${r.hit.signature}`, complete: r.complete, signaturesScanned: r.scanned,
+        explorerUrl: `https://solscan.io/tx/${r.hit.signature}`, method: r.hit.method, complete: r.complete, signaturesScanned: r.scanned,
       });
       if (l) { stoppedAt = `labeled:${l.type}`; break; }
       if (Date.now() > deadline) { stoppedAt = "timeout"; complete = false; break; }

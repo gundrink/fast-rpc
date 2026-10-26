@@ -1,6 +1,6 @@
 // Read-only Solana JSON-RPC upstream: timeout, short TTL cache, in-flight dedupe, param limits.
 import { RpcError, INVALID_PARAMS } from "./errors.js";
-import { decodeTransaction } from "./codec.js";
+import { decodeTransaction, b58decode } from "./codec.js";
 import { createDas } from "./das.js";
 import { getTransactionsForAddress } from "./history.js";
 import { ChainState } from "./chain.js";
@@ -32,16 +32,25 @@ export interface SolanaApiOptions {
   fetcher?: typeof fetch;
 }
 
-export function createUpstream(url = upstreamUrl, timeoutMs = Number(process.env.SOLANA_TIMEOUT_MS ?? 10_000)) {
+export const upstreamStats = { retries429: 0 };
+const isRateLimit = (e: any) => e instanceof RpcError && (e.code === 429 || e.code === -32429 || /too many requests|rate limit/i.test(e.message));
+export { isRateLimit };
+/** backoff for attempt n (0-based): Retry-After (s or HTTP date) if given, else 250ms*2^n with jitter, capped 8s */
+export function backoffMs(n: number, retryAfter?: string | null) {
+  if (retryAfter) { const s = Number(retryAfter); const ms = Number.isFinite(s) ? s * 1000 : Date.parse(retryAfter) - Date.now(); if (ms > 0) return Math.min(ms, 30_000); }
+  return Math.min(8000, 250 * 2 ** n) * (0.75 + Math.random() * 0.5);
+}
+export function createUpstream(url = upstreamUrl, timeoutMs = Number(process.env.SOLANA_TIMEOUT_MS ?? 10_000), retries = Number(process.env.UPSTREAM_429_RETRIES ?? 3)) {
   const cache = new Map<string, { exp: number; p: Promise<any> }>();
   let seq = 0;
+  const stats = upstreamStats;
   return function upstream(method: string, params: any[] = [], ttlMs = 0): Promise<any> {
     const key = method + JSON.stringify(params);
     const now = Date.now();
     const hit = cache.get(key);
     if (hit && hit.exp > now) return hit.p;
     if (hit) cache.delete(key);
-    const p = (async () => {
+    const once = async () => {
       let res: Response;
       try {
         res = await fetch(url, {
@@ -54,10 +63,18 @@ export function createUpstream(url = upstreamUrl, timeoutMs = Number(process.env
       }
       const text = await res.text();
       let j: any;
-      try { j = JSON.parse(text); } catch { throw new RpcError(res.status === 429 ? 429 : -32603, `upstream HTTP ${res.status}`); }
-      if (j?.error) throw new RpcError(j.error.code ?? -32603, j.error.message ?? "upstream error", j.error.data);
-      if (!res.ok) throw new RpcError(-32603, `upstream HTTP ${res.status}`);
+      const ra = res.headers.get("retry-after");
+      const tag = (e: RpcError) => Object.assign(e, { retryAfter: ra });
+      try { j = JSON.parse(text); } catch { throw tag(new RpcError(res.status === 429 ? 429 : -32603, `upstream HTTP ${res.status}`)); }
+      if (j?.error) throw tag(new RpcError(res.status === 429 ? 429 : j.error.code ?? -32603, j.error.message ?? "upstream error", j.error.data));
+      if (!res.ok) throw tag(new RpcError(res.status === 429 ? 429 : -32603, `upstream HTTP ${res.status}`));
       return j.result;
+    };
+    const p = (async () => {
+      for (let n = 0; ; n++) {
+        try { return await once(); }
+        catch (e: any) { if (n >= retries || !isRateLimit(e)) throw e; stats.retries429++; await new Promise((r) => setTimeout(r, backoffMs(n, e.retryAfter))); }
+      }
     })();
     if (ttlMs > 0) {
       cache.set(key, { exp: now + ttlMs, p });
@@ -101,6 +118,24 @@ export function createSolanaApi(opts: SolanaApiOptions = {}) {
   const pass = (method: string, ttl: number | (() => number) = 0, check?: (a: any[]) => void) => (...a: any[]) => { const p = clean(a); check?.(p); return up(method, p, typeof ttl === "function" ? ttl() : ttl); };
   const needKey = (m: string) => (a: any[]) => { if (typeof a[0] !== "string" || !a[0]) throw INVALID_PARAMS(`${m}: params[0] must be a base58 string`); };
 
+  /** compute-unit prices (microlamports) of non-vote txs in the latest confirmed block(s), optionally only txs touching `keys` */
+  const CB = "ComputeBudget111111111111111111111111111111";
+  const blockCuPrices = async (keys: string[]) => {
+    const slot: number = await up("getSlot", [{ commitment: "confirmed" }], chain.slots(1));
+    const want = new Set(keys); const out: number[] = [];
+    for (let s = slot, tries = 0; tries < 4 && out.length < 50; s--, tries++) {
+      let b: any; try { b = await up("getBlock", [s, { encoding: "json", maxSupportedTransactionVersion: 1, transactionDetails: "full", rewards: false, commitment: "confirmed" }], 10_000); } catch { continue; }
+      for (const t of b?.transactions ?? []) {
+        const m = t.transaction?.message; if (!m) continue;
+        const ks: string[] = [...m.accountKeys, ...(t.meta?.loadedAddresses?.writable ?? []), ...(t.meta?.loadedAddresses?.readonly ?? [])];
+        if (want.size && !ks.some((k) => want.has(k))) continue;
+        let price = -1;
+        for (const ix of m.instructions) { if (ks[ix.programIdIndex] !== CB) continue; try { const d = b58decode(ix.data); if (d[0] === 3 && d.length >= 9) price = Number(d.readBigUInt64LE(1)); } catch {} }
+        if (price >= 0) out.push(price); // only txs that explicitly set a CU price
+      }
+    }
+    return out.sort((x, y) => x - y);
+  };
   const jito = createJito(opts.jito);
   const dual = opts.jitoDualSend ?? process.env.SEND_JITO === "1";
   const tpu = createTpuSender(up, { transport: opts.tpuTransport });
@@ -204,7 +239,13 @@ export function createSolanaApi(opts: SolanaApiOptions = {}) {
       if (o0.lookbackSlots) { const top = fees.reduce((m, f) => Math.max(m, f.slot), 0); fees = fees.filter((f) => f.slot > top - o0.lookbackSlots); }
       // Helius evaluateEmptySlotAsZero (default true): slots without fees count as 0; false => ignore them
       if (o0.evaluateEmptySlotAsZero === false) fees = fees.filter((f) => f.prioritizationFee > 0);
-      const v = fees.map((f) => f.prioritizationFee).sort((x, y) => x - y);
+      let v = fees.map((f) => f.prioritizationFee).sort((x, y) => x - y);
+      let source = "getRecentPrioritizationFees";
+      // getRecentPrioritizationFees reports the per-slot MINIMUM fee (often all 0 on mainnet). Helius ranks actual
+      // tx-level prices, so when every sample is 0 (or PRIORITY_FEE_SOURCE=blocks) sample recent block(s) instead.
+      if ((process.env.PRIORITY_FEE_SOURCE === "blocks" || (v.length && v[v.length - 1] === 0)) && process.env.PRIORITY_FEE_SOURCE !== "recent") {
+        try { const bv = await blockCuPrices(keys); if (bv.length) { v = bv; source = "recentBlocks"; } } catch { /* keep min-fee samples */ }
+      }
       const pct = (q: number) => (v.length ? v[Math.min(v.length - 1, Math.max(0, Math.ceil((q / 100) * v.length) - 1))] : 0);
       const levels = { min: v[0] ?? 0, low: pct(25), medium: pct(50), high: pct(75), veryHigh: pct(95), unsafeMax: v.at(-1) ?? 0 };
       const o = req.options ?? {};
@@ -212,7 +253,7 @@ export function createSolanaApi(opts: SolanaApiOptions = {}) {
       if (!k) throw INVALID_PARAMS(`getPriorityFeeEstimate: unknown priorityLevel ${o.priorityLevel}`);
       // Helius `recommended`: medium with a 10,000 microlamport floor
       const est = o.recommended ? Math.max(levels.medium, Number(process.env.PRIORITY_FEE_FLOOR ?? 10_000)) : (levels as any)[k];
-      if (o.includeAllPriorityFeeLevels) return { priorityFeeEstimate: est, priorityFeeLevels: levels };
+      if (o.includeAllPriorityFeeLevels) return { priorityFeeEstimate: est, priorityFeeLevels: levels, ...(o.includeDetails ? { source, samples: v.length } : {}) };
       return { priorityFeeEstimate: est };
     },
   };

@@ -1,0 +1,13 @@
+block 461586024: 274 txs, sampled 6 fee payers; upstreams: https://solana-rpc.publicnode.com, https://api.mainnet-beta.solana.com, https://api.mainnet.solana.com
+{"address":"GBQ2GvTzmjXMu97dr7WUnLKYTNim1aoZsYS53KYXAAAA","ms":2241,"complete":true,"truncated":false,"stoppedAt":"noIncomingSol","chain":[]}
+{"address":"BAMgx3XPWrXkNUuQiVWUZU6eB2HQZdwz9HNnT4tpo8LG","ms":2134,"complete":false,"truncated":true,"stoppedAt":"truncated","chain":[]}
+{"address":"FTp1BybZ51NiZKbnZH6MsrV3tUZNauhpQMbBcqYUEr5f","ms":1963,"complete":false,"truncated":true,"stoppedAt":"truncated","chain":[]}
+{"address":"83TSSS7qojPowqrrvH23mCrhEJjnJG2ygaf7FEq9ZgKC","ms":2063,"complete":false,"truncated":true,"stoppedAt":"truncated","chain":[]}
+{"address":"7RrqWam5ri2Yu6fUtiCp2dwqaydjJYMXz6HtCnQPGbDY","ms":2113,"complete":false,"truncated":true,"stoppedAt":"truncated","chain":[]}
+{"address":"CRpVXnj48ecKmgdAD1azDAZN92khBEeTFNChu4XWJfVA","ms":1979,"complete":false,"truncated":true,"stoppedAt":"truncated","chain":[]}
+{"address":"JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4","ms":1888,"complete":false,"truncated":true,"stoppedAt":"truncated","chain":[]}
+getTpuLeaders {"ok":true,"ms":257,"v":[{"leader":"FbYX2uN573G5WsgiPdHU6fS5PNUyjdXfGfpZNkYUuT4k","addr":"185.189.44.171:12002"},{"leader":"PKdLMugp1Mf88Ji1GkdqRDBewaUh2cqg79CBEo6eJoQ","addr":"92.42.110.111:9007"},{"leader":"CQdLgwkmmHF8DE6t4sguXMTXWDxq3oLh3xfekDTmow12","addr":"198.13.140.105:9007"},{"leader":"DrifTrN923QaouP89UxkQzFGbumKPCnfkNYQRwmZxatz","addr":"63.254.166.232:9007"}]}
+getPriorityFeeEstimate {"ok":true,"ms":1844,"v":{"priorityFeeEstimate":14530,"priorityFeeLevels":{"min":1,"low":4343,"medium":14530,"high":42988,"veryHigh":77996,"unsafeMax":428571},"source":"recentBlocks","samples":44}}
+getPriorityFeeEstimate(global) {"ok":true,"ms":1857,"v":{"priorityFeeEstimate":93175,"priorityFeeLevels":{"min":0,"low":2771,"medium":93175,"high":1020408,"veryHigh":19856319,"unsafeMax":1000000000},"source":"recentBlocks","samples":238}}
+getSmartFees {"ok":true,"ms":2193,"v":{"computeUnitPrice":374774,"priorityFeeLevels":{"min":5000,"low":16666,"medium":100000,"high":374774,"veryHigh":1728344,"unsafeMax":1728344},"jitoTip":{"lamports":10000,"percentile":"50","source":"https://bundles.jito.wtf/api/v1/bundles/tip_floor"}}}
+upstreams [{"url":"https://solana-rpc.publicnode.com","latencyMs":266,"ok":323,"fail":0,"healthy":true},{"url":"https://api.mainnet-beta.solana.com","latencyMs":969,"ok":3,"fail":0,"healthy":true},{"url":"https://api.mainnet.solana.com","latencyMs":1647,"ok":6,"fail":0,"healthy":true}] 429 retries 0

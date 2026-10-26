@@ -326,3 +326,14 @@ npx tsx examples/live-upgrade.ts   # read-only mainnet: TPU leaders + funded-by 
 - **No Geyser:** without a Yellowstone endpoint, streaming uses standard WebSocket pubsub, with higher latency and no full-block or account firehose.
 - **No QUIC in Node 20/24:** stable Node has no built-in QUIC, so direct TPU needs an external QUIC lib or sidecar. Railway also has no public inbound UDP; outbound QUIC to leaders is untested there.
 - **Labels:** the label list is empty until you add verified entries, so CEX/mixer detection only works for addresses you add.
+
+### Live verification (read-only mainnet)
+```
+npx tsx examples/live-verify.ts 6   # funded-by on fee payers sampled from a recent block, plus a busy address; TPU leaders; fee estimates
+npx tsx examples/live-429.ts 60     # burst against public RPCs: no retry vs 429 backoff vs racing
+```
+- Free, keyless mainnet RPCs that were verified working (2026-10-26): `https://solana-rpc.publicnode.com` (fastest), `https://api.mainnet-beta.solana.com`, `https://api.mainnet.solana.com`.
+- These were rejected: drpc (free plan has no Solana), ankr (needs a key), onfinality (429 without a key), extrnode (unreachable), omniatech (521).
+- 429 handling: retries honor `Retry-After` (in seconds or as an HTTP date), otherwise back off at 250ms·2ⁿ with jitter, capped at 8s (`UPSTREAM_429_RETRIES`, default 3). Inside a race, each upstream fails fast, the racer fails over, then the whole round is retried with backoff (`RACE_429_ROUNDS`).
+- `getPriorityFeeEstimate`: mainnet `getRecentPrioritizationFees` returns per-slot **minimums**, which are usually all 0. When every sample is 0, the estimate is computed instead from explicit `SetComputeUnitPrice` values in the most recent blocks (`source:"recentBlocks"` with `includeDetails:true`). `PRIORITY_FEE_SOURCE=recent|blocks` forces one or the other.
+- Funded-by ignores dust below `FUNDED_BY_MIN_LAMPORTS` (default 100000), because address-poisoning spam showed up as a fake "funder". It also falls back to a balance-delta check when the funding moved through a CPI rather than a System instruction.

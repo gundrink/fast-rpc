@@ -348,3 +348,7 @@ npx tsx examples/live-429.ts 60     # burst against public RPCs: no retry vs 429
 - Docker: the multi-stage build compiles the sidecar. `TPU_SIDECAR=1` starts it inside the container (see `docker-entrypoint.sh`).
 - Identity: an ephemeral **unstaked** keypair, unless `TPU_IDENTITY_KEYPAIR` is set. Only a staked validator identity gets SWQoS priority.
 - Live check (read-only): run `cargo build --release` in `tpu-sidecar`, then `./tpu-sidecar/target/release/tpu-sidecar &`, then `TPU_SIDECAR_URL=http://127.0.0.1:7799 npx tsx examples/live-tpu-handshake.ts 6`.
+
+### Full read-only mainnet check
+`FRPC_URL=https://<deploy> FRPC_KEY=<key> npx tsx examples/live-mainnet-full.ts` runs ~90 read-only checks: standard RPC, WebSocket pubsub, transactionSubscribe, fees, DAS, enhanced transactions, funded-by, webhooks CRUD, Jito reads, TPU handshake and Alpenglow detection. The last output is in `examples/live-mainnet-full.last.txt`. The script never sends transactions; simulate and fee checks use unsigned dummies.
+- Mainnet now carries **v1 transactions** (SIMD-0385): typically about half of a block, as in the last run. The proxy always asks upstream for `maxSupportedTransactionVersion >= 1`, `decodeTransaction` parses v1 wire format, and fee sampling reads `transactionConfig.priorityFee`.

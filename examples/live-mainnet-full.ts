@@ -114,7 +114,9 @@ const lb = await rpc("getLatestBlockhash").catch(() => null);
 const tokAcct = (await rpc("getTokenAccountsByOwner", [usdcHolder ?? payer, { programId: TOKEN }, { encoding: "base64", dataSlice: { offset: 0, length: 0 } }]).catch(() => null))?.value?.[0]?.pubkey;
 for (const [m, p, f] of std) {
   if (m === "getTokenAccountBalance") p[0] = tokAcct; if (m === "isBlockhashValid") p[0] = lb?.value?.blockhash;
-  if (m === "getFeeForMessage") p[0] = buildLegacyTx([payer, "11111111111111111111111111111111"], 1, []).subarray(1).toString("base64");
+  if (m === "getFeeForMessage") { // legacy message: payer -> payer 0-lamport transfer, real blockhash (fee quote only, never sent)
+    const { b58decode } = await import("../src/index.js"); const d = Buffer.alloc(12); d.writeUInt32LE(2, 0);
+    p[0] = Buffer.concat([Buffer.from([1, 0, 1, 2]), b58decode(payer), Buffer.alloc(32), b58decode(lb.value.blockhash), Buffer.from([1, 1, 2, 0, 0, 12]), d]).toString("base64"); }
   await check(m, async () => { const r = await rpc(m.split(" ")[0], p); const v = f(r); must(v !== undefined && v !== false && v !== null, `unexpected ${short(r)}`); return short(v); });
 }
 

@@ -212,3 +212,31 @@ test("priority fee: all-zero min-fee samples -> falls back to real CU prices fro
     assert.equal(r.source, "recentBlocks"); assert.ok(r.samples >= 4); assert.equal(r.priorityFeeLevels.unsafeMax, 50000); assert.ok(r.priorityFeeLevels.medium > 0);
   } finally { await ap.close(); await m.close(); }
 });
+
+test("tpu-sidecar transport: handshake + send through a MOCK sidecar; wired by tpuTransport into retry sender", async () => {
+  const http = await import("node:http"); const { SidecarTransport } = await import("../src/index.js");
+  const got: any[] = [];
+  const srv = http.createServer((req, res) => { let b = ""; req.on("data", (c) => (b += c)); req.on("end", () => {
+    const j = b ? JSON.parse(b) : {}; got.push({ path: req.url, j }); res.writeHead(200, { "content-type": "application/json" });
+    if (req.url === "/health") return res.end('{"ok":true}');
+    res.end(JSON.stringify(j.addrs.map((a: string) => ({ addr: a, ok: a !== "9.9.9.9:1", ms: 1, reused: false, ...(a === "9.9.9.9:1" ? { error: "timeout" } : {}) }))));
+  }); });
+  await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
+  const t = new SidecarTransport(`http://127.0.0.1:${(srv.address() as net.AddressInfo).port}`);
+  try {
+    assert.equal((await t.health()).ok, true);
+    const hs = await t.handshake(["1.2.3.4:8009", "9.9.9.9:1"]); assert.deepEqual(hs.map((x) => x.ok), [true, false]);
+    await t.send("1.2.3.4:8009", Buffer.from([1, 2, 3])); assert.equal(got.at(-1).j.wire_b64, "AQID");
+    await assert.rejects(t.send("9.9.9.9:1", Buffer.from([1])), /timeout/);
+    const m = await startMockSolana(); const L = pk();
+    m.responses.getSlotLeaders = () => [L]; m.responses.getClusterNodes = () => [{ pubkey: L, tpuQuic: "1.2.3.4:8009" }];
+    m.responses.sendTransaction = () => "x"; m.responses.isBlockhashValid = () => ({ value: true });
+    m.responses.getSignatureStatuses = () => ({ value: [{ slot: 1, confirmationStatus: "finalized", err: null }] });
+    const ap = createFastRpc({ api: { url: m.httpUrl, tpuTransport: t }, hub: { wsUrl: m.wsUrl }, webhooks: false, chain: { detect: false } });
+    try {
+      const r = await (ap.api as any).sendTransactionWithRetry(signedTx().b64, {});
+      assert.equal(r.paths.tpu, 1); assert.equal(got.filter((g) => g.path === "/send").length, 3);
+      assert.equal((await (ap.api as any).getTpuHandshake())[0].ok, true);
+    } finally { await ap.close(); await m.close(); }
+  } finally { srv.close(); }
+});

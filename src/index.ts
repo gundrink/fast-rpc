@@ -5,3 +5,4 @@ export * from "./jito.js"; export * from "./geyser.js"; export * from "./bubbleg
 export * from "./txerror.js"; export * from "./recorder.js"; export * from "./offchain.js"; export * from "./collections.js";
 export * from "./history.js";
 export * from "./fundedby.js"; export * from "./auth.js"; export * from "./race.js"; export * from "./sender.js"; export * from "./tpu.js";
+export * from "./tpu-sidecar.js";

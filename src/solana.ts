@@ -9,6 +9,7 @@ import { createRacedUpstream, type RaceOptions } from "./race.js";
 import { createFundedBy, type FundedByOptions } from "./fundedby.js";
 import { createSender, smartFees } from "./sender.js";
 import { createTpuSender, type TpuTransport } from "./tpu.js";
+import { sidecarFromEnv, SidecarTransport } from "./tpu-sidecar.js";
 
 export const upstreamUrl = process.env.SOLANA_RPC_URL ?? "https://api.mainnet-beta.solana.com";
 export interface SolanaApiOptions {
@@ -138,7 +139,8 @@ export function createSolanaApi(opts: SolanaApiOptions = {}) {
   };
   const jito = createJito(opts.jito);
   const dual = opts.jitoDualSend ?? process.env.SEND_JITO === "1";
-  const tpu = createTpuSender(up, { transport: opts.tpuTransport });
+  const tpuTransport = opts.tpuTransport ?? sidecarFromEnv();
+  const tpu = createTpuSender(up, { transport: tpuTransport });
   const sender = createSender({ read: up, senders, chain, jitoSend: (t, c) => jito.sendTransaction(t, c), jitoCheck: (t, c) => jito.checkTip(t, c), tpu });
   let fb: ReturnType<typeof createFundedBy> | undefined;
   const api = {
@@ -151,6 +153,12 @@ export function createSolanaApi(opts: SolanaApiOptions = {}) {
     getSmartFees: (req: any = {}) => smartFees((r) => (api as any).getPriorityFeeEstimate(r), req ?? {}, undefined, opts.fetcher),
     /** next leaders' TPU-QUIC addresses (read-only) */
     getTpuLeaders: () => tpu.leaderAddrs(),
+    /** read-only connectivity check: QUIC handshake to the next leaders via tpu-sidecar (no stream, nothing sent) */
+    getTpuHandshake: async () => {
+      if (!(tpuTransport instanceof SidecarTransport)) throw new RpcError(-32601, "getTpuHandshake needs TPU_SIDECAR_URL");
+      const l = await tpu.leaderAddrs(); const r = await tpuTransport.handshake(l.map((x) => x.addr));
+      return l.map((x, i) => ({ ...x, ...r[i] }));
+    },
     getUpstreamStats: () => raced?.stats() ?? [{ url: (opts.url ?? upstreamUrl).replace(/([?&]api-key=)[^&]+/, "$1***"), single: true }],
     getClusterNodes: pass("getClusterNodes", 30_000),
     getSlotLeaders: pass("getSlotLeaders", 0),

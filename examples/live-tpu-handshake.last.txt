@@ -1,0 +1,26 @@
+sidecar {"allowSend":false,"identity":"57YeCDMvZjw653GF9sMLd6VxZJUVnLefJUK8yTJ3wPbL","ok":true}
+round 1 A1vqhA2f… 63.254.166.232:12313 OK 0.0ms (reused)
+round 1 EvnRmnMr… 104.204.143.114:9007 OK 0.0ms (reused)
+round 1 H9ENbtmy… 198.13.140.105:9007 OK 190.2ms
+round 1 91oPXTs2… 63.254.167.199:5010 OK 87.6ms
+round 2 ALp2GdA1… 63.254.166.232:9007 OK 172.5ms
+round 2 Aw5wEMXh… 63.254.167.199:5010 OK 86.8ms
+round 2 FBKFWadX… 64.130.46.242:12326 OK 168.7ms
+round 2 Fd7btgyS… 198.13.140.105:12341 OK 189.4ms
+round 3 5Cchr1XG… 63.254.180.13:5010 OK 61.8ms
+round 3 Fd7btgyS… 198.13.140.105:12341 OK 0.0ms (reused)
+round 3 8gDfqHXZ… 67.213.121.155:8002 OK 101.2ms
+round 3 6yFGGAgY… 198.13.140.105:12293 OK 190.5ms
+round 4 5pPRHnie… 188.42.129.244:11228 OK 98.5ms
+round 4 jzDsimGW… 64.130.51.255:5010 OK 20.5ms
+round 4 9eGrDohd… 86.54.152.246:9007 OK 182.9ms
+round 4 AMukCLCr… 63.254.166.232:9007 OK 0.0ms (reused)
+round 5 DP9SwUE9… 94.242.197.139:11228 OK 106.2ms
+round 5 DNVZMSqe… 23.109.46.35:9007 OK 186.7ms
+round 5 GQzMeEMw… 208.91.109.115:5010 OK 142.7ms
+round 5 CAo1dCGY… 64.130.46.242:12291 OK 164.9ms
+round 6 AiDoLWFK… 198.13.141.173:5010 OK 97.5ms
+round 6 C8Bey3LK… 185.26.10.33:8022 OK 99.1ms
+round 6 JD549Hsb… 86.54.153.246:9007 OK 43.1ms
+round 6 9eGrDohd… 86.54.152.246:9007 OK 0.0ms (reused)
+{"newHandshakes":19,"ok":19,"failed":0,"p50ms":"106.2","maxMs":"190.5","errors":[]}

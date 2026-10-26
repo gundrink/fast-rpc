@@ -337,3 +337,14 @@ npx tsx examples/live-429.ts 60     # burst against public RPCs: no retry vs 429
 - 429 handling: retries honor `Retry-After` (in seconds or as an HTTP date), otherwise back off at 250ms·2ⁿ with jitter, capped at 8s (`UPSTREAM_429_RETRIES`, default 3). Inside a race, each upstream fails fast, the racer fails over, then the whole round is retried with backoff (`RACE_429_ROUNDS`).
 - `getPriorityFeeEstimate`: mainnet `getRecentPrioritizationFees` returns per-slot **minimums**, which are usually all 0. When every sample is 0, the estimate is computed instead from explicit `SetComputeUnitPrice` values in the most recent blocks (`source:"recentBlocks"` with `includeDetails:true`). `PRIORITY_FEE_SOURCE=recent|blocks` forces one or the other.
 - Funded-by ignores dust below `FUNDED_BY_MIN_LAMPORTS` (default 100000), because address-poisoning spam showed up as a fake "funder". It also falls back to a balance-delta check when the funding moved through a CPI rather than a System instruction.
+
+### Direct TPU-QUIC send (tpu-sidecar, off by default)
+- `tpu-sidecar/` is a small Rust service. It uses Agave's `solana-tls-utils` for the client certificate and server verifier, plus Anza's `quinn` fork, which is the same stack `tpu-client-next` uses, with ALPN `solana-tpu`. Connections are reused and kept alive.
+- It listens on loopback HTTP only (`TPU_SIDECAR_LISTEN`, default `127.0.0.1:7799`):
+  - `GET /health`
+  - `POST /handshake {addrs}`: QUIC connect only. It opens no stream and sends nothing.
+  - `POST /send {wire_b64, addrs}`: opens one unidirectional stream per leader. It returns **403 unless `TPU_SIDECAR_ALLOW_SEND=1`** is set.
+- In fast-rpc, setting `TPU_SIDECAR_URL` turns on the TPU path. `sendTransactionWithRetry` then also sends to the next `TPU_FANOUT` leaders every round. `getTpuHandshake` is a read-only connectivity check.
+- Docker: the multi-stage build compiles the sidecar. `TPU_SIDECAR=1` starts it inside the container (see `docker-entrypoint.sh`).
+- Identity: an ephemeral **unstaked** keypair, unless `TPU_IDENTITY_KEYPAIR` is set. Only a staked validator identity gets SWQoS priority.
+- Live check (read-only): run `cargo build --release` in `tpu-sidecar`, then `./tpu-sidecar/target/release/tpu-sidecar &`, then `TPU_SIDECAR_URL=http://127.0.0.1:7799 npx tsx examples/live-tpu-handshake.ts 6`.

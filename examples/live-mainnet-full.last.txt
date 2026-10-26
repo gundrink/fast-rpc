@@ -1,0 +1,95 @@
+context: slot=461702904 block=461702864 txs=375 versions: v1=162 v0=126 legacy=87
+
+83/91 passed  (2026-10-26T14:49:42.205Z, https://fast-rpc-production.up.railway.app)
+
+PASS  GET /health                                             468ms  ok
+PASS  GET /healthz                                            427ms  {"ok":true,"uptimeS":17,"chain":"alpenglow"}
+PASS  no key -> 401                                           435ms  401
+PASS  wrong key -> 401                                        430ms  401
+PASS  GET /metrics                                            419ms  10 lines
+PASS  Alpenglow detection (/v0/chain)                         435ms  {"consensus":"alpenglow","genesisSlot":459652999,"slotMs":200,"slotSamples":0,"defaultCommitment":"finalized",
+PASS  JSON-RPC batch                                          475ms  2/2
+PASS  getAccountInfo                                          489ms  TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA
+PASS  getAccountInfo jsonParsed (BONK mint)                   451ms  mint
+PASS  getBalance                                              459ms  true
+PASS  getBlock (no version param)                             523ms  375
+PASS  getBlock (version 0 -> upgraded)                        671ms  375
+PASS  getBlockCommitment                                      477ms  0
+PASS  getBlockHeight                                          461ms  true
+PASS  getBlockProduction                                      535ms  {"firstSlot":461376000,"lastSlot":461702971}
+PASS  getBlockTime                                            473ms  true
+PASS  getBlocks                                               448ms  true
+PASS  getBlocksWithLimit                                      457ms  5
+PASS  getClusterNodes                                        1504ms  3887
+PASS  getEpochInfo                                            454ms  1068
+PASS  getEpochSchedule                                        443ms  432000
+FAIL  getFeeForMessage                                        455ms  -32602 failed to deserialize solana_message::versions::VersionedMessage: Attempting to read 32 bytes
+PASS  getFirstAvailableBlock                                  452ms  true
+PASS  getGenesisHash                                          498ms  true
+PASS  getHealth                                               459ms  true
+PASS  getHighestSnapshotSlot                                  520ms  461171133
+PASS  getIdentity                                             497ms  2r1F4iWqVcb8M1DbAjQuFpebkQHY9hcVU4WuW2DJBppN
+PASS  getInflationGovernor                                    482ms  0.08
+PASS  getInflationRate                                        458ms  1068
+PASS  getInflationReward                                      529ms  true
+FAIL  getLargestAccounts                                    30781ms  429 Too many requests for a specific RPC call
+PASS  getLatestBlockhash                                     1173ms  9uQi9qBXjrr6Lf2cfoaLirvraa3YBfkjuKFF7eTcNjJ9
+PASS  getLeaderSchedule                                       478ms  true
+PASS  getMaxRetransmitSlot                                    460ms  true
+PASS  getMaxShredInsertSlot                                   492ms  true
+PASS  getMinimumBalanceForRentExemption                       454ms  true
+PASS  getMultipleAccounts                                     471ms  true
+PASS  getProgramAccounts (filtered)                           469ms  0
+PASS  getRecentPerformanceSamples                             446ms  3
+PASS  getRecentPrioritizationFees                             461ms  150
+PASS  getSignatureStatuses                                    452ms  finalized
+PASS  getSignaturesForAddress                                 449ms  3
+PASS  getSlot                                                 574ms  true
+PASS  getSlotLeader                                           484ms  DcTPJqPNrTLv3te1c9ctA9H194x6DsaPA4ChuSEv7KPZ
+PASS  getSlotLeaders                                          435ms  4
+PASS  getStakeMinimumDelegation                               450ms  true
+PASS  getSupply                                              6309ms  636457025140276400
+FAIL  getTokenAccountBalance                                 1101ms  -32602 getTokenAccountBalance: params[0] must be a base58 string
+PASS  getTokenAccountsByOwner                                 579ms  0
+FAIL  getTokenLargestAccounts                                3469ms  -32602 Request blocked
+PASS  getTokenSupply                                          536ms  87994317938531.91604
+PASS  getTransaction (no version param)                       459ms  461702864
+PASS  getTransaction (version 0 -> upgraded)                  416ms  461702864
+PASS  getTransaction jsonParsed v1                            457ms  v1
+PASS  getTransaction base64 v0                                467ms  v0
+PASS  getTransaction legacy                                   459ms  legacy
+PASS  getTransactionCount                                     469ms  true
+PASS  getVersion                                              454ms  4.3.2
+PASS  getVoteAccounts                                         553ms  665
+PASS  isBlockhashValid                                        456ms  true
+PASS  minimumLedgerSlot                                       449ms  true
+PASS  simulateTransaction (unsigned dummy, sigVerify:false)    463ms  err=null units=0
+PASS  getPriorityFeeEstimate                                 1574ms  {"min":0,"low":0,"medium":0,"high":0,"veryHigh":0,"unsafeMax":0}
+PASS  getPriorityFeeEstimate (v1 tx)                          456ms  {"priorityFeeEstimate":13500000}
+PASS  getPriorityFeeEstimate (global, no keys)                686ms  {"priorityFeeEstimate":12501,"priorityFeeLevels":{"min":0,"low":1041,"medium":12501,"high":142857,"veryHigh":2
+PASS  getSmartFees                                            931ms  {"computeUnitPrice":230335,"priorityFeeLevels":{"min":0,"low":1333,"medium":13457,"high":230335,"veryHigh":326
+PASS  getAsset (fungible BONK)                                475ms  FungibleToken Bonk
+PASS  getAsset (wSOL)                                         470ms  FungibleToken SOL
+PASS  getAssetsByOwner (showFungible)                         651ms  total=10 items=10 fungible=10
+PASS  searchAssets (owner, fungible)                          572ms  items=10
+PASS  getTokenAccounts (mint USDC)                          10614ms  n=0
+PASS  getTokenAccounts (owner)                               1051ms  n=5
+FAIL  find cNFT (searchAssets compressed)                   45049ms  no compressed asset discoverable (needs indexed trees)
+FAIL  getAssetProof (cNFT)                                      0ms  no cNFT id
+PASS  getTransactionsForAddress                               885ms  n=3 versions=0,0,0
+PASS  POST /v0/transactions (v1+v0+legacy)                    440ms  UNKNOWN,UNKNOWN,UNKNOWN
+FAIL  Enhanced: v1 SOL transfer -> TRANSFER                     0ms  no v1 transfer in sample block
+PASS  GET /v0/addresses/:a/transactions                      1107ms  n=3 types=SWAP,SWAP,SWAP
+PASS  getFundedBy (young wallet)                             1260ms  5hnNb4… funder=5pVN5XZB8cYBjNLFrsBCPWkCQBan5K5Mq2dWGzwPgGJV stoppedAt=null
+PASS  GET /v0/addresses/:a/funded-by                          411ms  {"address":"5hnNb4Lf3A9SkZXtMHYQKyyDu1m96d5enmkfncDyYQtD","funder":"5pVN5XZB8cYBjNLFrsBCPWkCQBan5K5Mq2dWGzwPgG
+PASS  webhooks CRUD                                          2481ms  create/list/get/update/delete ok
+PASS  getTipAccounts (Jito)                                   435ms  n=8
+PASS  Jito tip floor (public)                                1116ms  p50=0.0000011295000000000002
+PASS  getTpuLeaders                                           634ms  n=4
+PASS  getTpuHandshake (QUIC from Railway)                     556ms  4/4 ok, ms=74/33/3/17
+PASS  WS slotSubscribe                                       1822ms  sub=1 got 3
+PASS  WS accountSubscribe (Clock sysvar)                     1808ms  sub=2 got 1
+PASS  WS logsSubscribe (Token program)                       1840ms  sub=3 got 2
+PASS  WS signatureSubscribe (already-confirmed sig)          6006ms  subscribed (no notification for past sig: expected)
+FAIL  WS transactionSubscribe (Token program)               30026ms  timeout (0 notifications, sub=5)
+PASS  WS no key -> rejected                                  1259ms  HTTP 401

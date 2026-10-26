@@ -115,7 +115,7 @@ export class TxWatcher {
     }
   }
   private async fetch(sig: string) {
-    const cfg = { encoding: this.opts.encoding ?? "json", commitment: this.opts.commitment ?? this.hub.chain.defaultCommitment, maxSupportedTransactionVersion: Math.max(this.opts.maxSupportedTransactionVersion ?? 0, MAX_TX_VERSION) };
+    const cfg = { encoding: this.opts.encoding ?? "json", commitment: this.opts.commitment === "processed" ? "confirmed" : (this.opts.commitment ?? this.hub.chain.defaultCommitment), maxSupportedTransactionVersion: Math.max(this.opts.maxSupportedTransactionVersion ?? 0, MAX_TX_VERSION) };
     for (let i = 0; i <= this.cfg.retries; i++) {
       try { const r = await this.getTx(sig, cfg); if (r) return r; } catch {}
       if (this.stopped) return null;

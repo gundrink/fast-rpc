@@ -69,7 +69,7 @@ const std: [string, any[], (r: any) => any][] = [
   ["getClusterNodes", [], (r) => r.length],
   ["getEpochInfo", [], (r) => r.epoch],
   ["getEpochSchedule", [], (r) => r.slotsPerEpoch],
-  ["getFeeForMessage", ["AQABAgIAAQMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAQEAAA=="], (r) => r !== undefined],
+  ["getFeeForMessage", [null], (r) => r?.context?.slot],
   ["getFirstAvailableBlock", [], (r) => r >= 0],
   ["getGenesisHash", [], (r) => r === "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"],
   ["getHealth", [], (r) => r === "ok"],
@@ -111,9 +111,10 @@ const std: [string, any[], (r: any) => any][] = [
   ["minimumLedgerSlot", [], (r) => r >= 0],
 ];
 const lb = await rpc("getLatestBlockhash").catch(() => null);
-const tokAcct = (await rpc("getTokenLargestAccounts", [USDC]).catch(() => null))?.value?.[0]?.address;
+const tokAcct = (await rpc("getTokenAccountsByOwner", [usdcHolder ?? payer, { programId: TOKEN }, { encoding: "base64", dataSlice: { offset: 0, length: 0 } }]).catch(() => null))?.value?.[0]?.pubkey;
 for (const [m, p, f] of std) {
   if (m === "getTokenAccountBalance") p[0] = tokAcct; if (m === "isBlockhashValid") p[0] = lb?.value?.blockhash;
+  if (m === "getFeeForMessage") p[0] = buildLegacyTx([payer, "11111111111111111111111111111111"], 1, []).subarray(1).toString("base64");
   await check(m, async () => { const r = await rpc(m.split(" ")[0], p); const v = f(r); must(v !== undefined && v !== false && v !== null, `unexpected ${short(r)}`); return short(v); });
 }
 
@@ -155,7 +156,9 @@ await check("getTransactionsForAddress", async () => { const r = await rpc("getT
 await check("POST /v0/transactions (v1+v0+legacy)", async () => { const s = [v1, v0, legacy].filter(Boolean).map((t: any) => t.transaction.signatures[0]); const r = await rest("POST", "/v0/transactions", { transactions: s }); must(Array.isArray(r) && r.length === s.length && r.every((x: any) => x?.signature), short(r)); return r.map((x: any) => x.type).join(","); });
 await check("Enhanced: v1 SOL transfer -> TRANSFER", async () => {
   const SYS = "11111111111111111111111111111111";
-  const t = txs.find((x) => x.version === 1 && !x.meta.err && x.transaction.message.instructions.length === 1 && x.transaction.message.accountKeys[x.transaction.message.instructions[0].programIdIndex] === SYS && x.meta.preBalances[0] - x.meta.postBalances[0] > x.meta.fee);
+  const isT = (x: any) => x.version === 1 && !x.meta.err && x.transaction.message.instructions.length === 1 && x.transaction.message.accountKeys[x.transaction.message.instructions[0].programIdIndex] === SYS && x.meta.preBalances[0] - x.meta.postBalances[0] > x.meta.fee;
+  let t = txs.find(isT);
+  for (let s = bslot; !t && s > bslot - 6; s--) t = ((await rpc("getBlock", [s, { encoding: "json", transactionDetails: "full", rewards: false }]).catch(() => null))?.transactions ?? []).find(isT);
   must(t, "no v1 transfer in sample block"); const r = await rest("POST", "/v0/transactions", { transactions: [t.transaction.signatures[0]] });
   must(r[0]?.type === "TRANSFER" && r[0].nativeTransfers?.length, short(r[0])); return `${r[0].type} ${r[0].nativeTransfers[0].amount} lamports`;
 });
@@ -200,7 +203,8 @@ await check("WS signatureSubscribe (already-confirmed sig)", async () => {
   // finalized signatures notify immediately or never; accept subscription id as pass, notification as bonus
   return await wsSub("signatureSubscribe", [sig, { commitment: "confirmed" }], 1, 6_000).catch((e) => { if (/sub=\d+/.test(e.message) && !/sub=undefined/.test(e.message)) return "subscribed (no notification for past sig: expected)"; throw e; });
 });
-await check("WS transactionSubscribe (Token program)", () => wsSub("transactionSubscribe", [{ accountInclude: [TOKEN], vote: false, failed: false }, { commitment: "confirmed", encoding: "jsonParsed", transactionDetails: "full", maxSupportedTransactionVersion: 0 }], 2, 30_000));
+await check("WS transactionSubscribe (Token program)", () => wsSub("transactionSubscribe", [{ accountInclude: [TOKEN], vote: false, failed: false }, { commitment: "confirmed", encoding: "jsonParsed", transactionDetails: "full", maxSupportedTransactionVersion: 0 }], 2, 45_000));
+await check("WS transactionSubscribe processed (JUP)", () => wsSub("transactionSubscribe", [{ accountInclude: ["JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"], vote: false, failed: false }, { commitment: "processed", transactionDetails: "signatures" }], 2, 45_000));
 await check("WS no key -> rejected", () => new Promise((res, rej) => { const ws = new WebSocket(BASE.replace(/^http/, "ws") + "/"); ws.on("open", () => { ws.close(); rej(new Error("opened without key")); }); ws.on("error", (e: any) => res(short(e.message))); ws.on("unexpected-response", (_q: any, r: any) => res(`HTTP ${r.statusCode}`)); }));
 
 // ---- report ----

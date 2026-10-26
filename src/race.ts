@@ -9,7 +9,7 @@ export interface RaceOptions { rounds?: number; hedgeMs?: number; cooldownMs?: n
 const ANSWER = new Set([-32602, -32600, -32002, -32003, -32004, -32007, -32009, -32014, -32016]);
 
 /** provider gating dressed up as a param error (e.g. publicnode "Indexed requests require a personal token"): try the next upstream */
-const GATED = /personal token|api[- ]?key|requires? (a )?(paid|plan|subscription|token)|not available on this|disabled on this|upgrade your plan/i;
+const GATED = /personal token|api[- ]?key|requires? (a )?(paid|plan|subscription|token)|not available on this|disabled on this|upgrade your plan|request blocked/i;
 
 export function createRacedUpstream(urls: string[], o: RaceOptions = {}) {
   const hedgeMs = o.hedgeMs ?? Number(process.env.RACE_HEDGE_MS ?? 150);

@@ -9,7 +9,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { keccak_256 } from "@noble/hashes/sha3.js";
-import { b58decode, b58encode, findProgramAddress, isPubkey } from "./codec.js";
+import { b58decode, b58encode, findProgramAddress, isPubkey, MAX_TX_VERSION } from "./codec.js";
 import { TxWatcher, type GetTx, txAccountKeys } from "./txstream.js";
 import type { StreamHub } from "./stream.js";
 
@@ -353,7 +353,7 @@ export class CnftIndexer {
       for (const s of page) if (!s.err) sigs.push(s.signature);
       before = page.at(-1).signature; if (page.length < 1000) break;
     }
-    for (const s of sigs.reverse()) { const r = await rpc("getTransaction", [s, { encoding: "json", maxSupportedTransactionVersion: 0, commitment: "confirmed" }]); if (r) this.apply(r); }
+    for (const s of sigs.reverse()) { const r = await rpc("getTransaction", [s, { encoding: "json", maxSupportedTransactionVersion: MAX_TX_VERSION, commitment: "confirmed" }]); if (r) this.apply(r); }
     return sigs.length;
   }
 

@@ -3,7 +3,7 @@
 // result carries complete:false / truncated:true and reports the earliest incoming transfer that WAS seen.
 import fs from "node:fs";
 import { RpcError, INVALID_PARAMS } from "./errors.js";
-import { b58decode } from "./codec.js";
+import { b58decode, MAX_TX_VERSION } from "./codec.js";
 
 export type LabelType = "cex" | "mixer" | "bridge" | "program" | "other";
 export interface Label { address: string; name: string; type: LabelType; source?: string }
@@ -67,7 +67,7 @@ export function createFundedBy(call: Call, opts: FundedByOptions = {}) {
   /** ignore dust (address-poisoning spam) below this many lamports (default 100000 = 0.0001 SOL) */
   const minLamports = opts.minLamports ?? Number(process.env.FUNDED_BY_MIN_LAMPORTS ?? 100_000);
   const timeoutMs = opts.timeoutMs ?? Number(process.env.FUNDED_BY_TIMEOUT_MS ?? 30_000);
-  const maxTxVersion = Number(process.env.FUNDED_BY_MAX_TX_VERSION ?? 1);
+  const maxTxVersion = Number(process.env.FUNDED_BY_MAX_TX_VERSION ?? MAX_TX_VERSION);
   const cache = new Map<string, { at: number; v: any }>();
   if (cacheFile && fs.existsSync(cacheFile)) try { for (const [k, v] of Object.entries(JSON.parse(fs.readFileSync(cacheFile, "utf8")))) cache.set(k, v as any); } catch {}
   const persist = () => { if (cacheFile) try { fs.writeFileSync(cacheFile, JSON.stringify(Object.fromEntries(cache))); } catch {} };

@@ -15,17 +15,17 @@ const shape = (v: any, d = 0): any => v === null ? "null" : Array.isArray(v) ? (
 
 const WSOL = "So11111111111111111111111111111111111111112", TOKEN = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const slot = (await post(ours, "getSlot")).j.result;
-const blk = (await post(ours, "getBlock", [slot - 60, { transactionDetails: "signatures", rewards: false, maxSupportedTransactionVersion: 0 }])).j.result;
+const blk = (await post(ours, "getBlock", [slot - 60, { transactionDetails: "signatures", rewards: false, maxSupportedTransactionVersion: 1 }])).j.result;
 const sig = blk.signatures[Math.floor(blk.signatures.length / 2)];
-const tx = (await post(ours, "getTransaction", [sig, { maxSupportedTransactionVersion: 0, encoding: "json" }])).j.result;
+const tx = (await post(ours, "getTransaction", [sig, { maxSupportedTransactionVersion: 1, encoding: "json" }])).j.result;
 const payer = tx.transaction.message.accountKeys[0];
 const cases: [string, any[]][] = [
   ["getHealth", []], ["getEpochInfo", []],
   ["getAccountInfo", [WSOL, { encoding: "base64" }]],
   ["getMultipleAccounts", [[WSOL, TOKEN], { encoding: "base64", dataSlice: { offset: 0, length: 8 } }]],
   ["getSignaturesForAddress", [payer, { limit: 2 }]],
-  ["getTransaction", [sig, { maxSupportedTransactionVersion: 0, encoding: "json" }]],
-  ["getBlock", [slot - 50, { transactionDetails: "none", rewards: false, maxSupportedTransactionVersion: 0 }]],
+  ["getTransaction", [sig, { maxSupportedTransactionVersion: 1, encoding: "json" }]],
+  ["getBlock", [slot - 50, { transactionDetails: "none", rewards: false, maxSupportedTransactionVersion: 1 }]],
   ["getTokenSupply", [WSOL]],
 ];
 for (const [m, p] of cases) {

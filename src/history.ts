@@ -1,7 +1,7 @@
 // Helius history APIs on standard RPC: getTransactionsForAddress (JSON-RPC) and Enhanced Transactions REST
 // (POST /v0/transactions, GET /v0/addresses/:address/transactions).
 import { RpcError, INVALID_PARAMS } from "./errors.js";
-import { isPubkey } from "./codec.js";
+import { isPubkey, MAX_TX_VERSION } from "./codec.js";
 import { parseEnhanced } from "./enhanced.js";
 
 export type Rpc = (method: string, params: any[]) => Promise<any>;
@@ -91,7 +91,7 @@ export async function getTransactionsForAddress(rpc: Rpc, address: any, cfg: any
     const after = (s: any) => { const c = s.slot !== tok![0] ? s.slot - tok![0] : posIn.get(s.signature)! - tok![1]; return order === "asc" ? c > 0 : c < 0; };
     all = all.filter(after);
   }
-  const cfgTx = { encoding: cfg.encoding ?? "json", maxSupportedTransactionVersion: cfg.maxSupportedTransactionVersion ?? 0, commitment };
+  const cfgTx = { encoding: cfg.encoding ?? "json", maxSupportedTransactionVersion: Math.max(cfg.maxSupportedTransactionVersion ?? 0, MAX_TX_VERSION), commitment };
   let data: any[] = [];
   if (details === "signatures" && ta !== "balanceChanged") {
     data = all.slice(0, limit).map((s) => ({ signature: s.signature, slot: s.slot, transactionIndex: posIn.get(s.signature)!, err: s.err ?? null, memo: s.memo ?? null, blockTime: s.blockTime ?? null, confirmationStatus: s.confirmationStatus ?? null }));

@@ -1,6 +1,6 @@
 // Read-only Solana JSON-RPC upstream: timeout, short TTL cache, in-flight dedupe, param limits.
 import { RpcError, INVALID_PARAMS } from "./errors.js";
-import { decodeTransaction, b58decode } from "./codec.js";
+import { decodeTransaction, b58decode, MAX_TX_VERSION } from "./codec.js";
 import { createDas } from "./das.js";
 import { getTransactionsForAddress } from "./history.js";
 import { ChainState } from "./chain.js";
@@ -117,6 +117,12 @@ export function createSolanaApi(opts: SolanaApiOptions = {}) {
   const slotTtl = (n: number) => () => chain.slots(n);
   // Generic read-only passthrough with positional params (Solana style).
   const pass = (method: string, ttl: number | (() => number) = 0, check?: (a: any[]) => void) => (...a: any[]) => { const p = clean(a); check?.(p); return up(method, p, typeof ttl === "function" ? ttl() : ttl); };
+  /** mainnet carries v0 + v1 txs: always ask upstream for v1 so clients sending 0 / omitting it never get -32015 */
+  const txv = (a: any[]) => {
+    if (typeof a[1] === "string") a[1] = { encoding: a[1] };
+    const c = a[1] && typeof a[1] === "object" ? a[1] : {};
+    a[1] = { ...c, maxSupportedTransactionVersion: Math.max(Number(c.maxSupportedTransactionVersion ?? 0) || 0, MAX_TX_VERSION) };
+  };
   const needKey = (m: string) => (a: any[]) => { if (typeof a[0] !== "string" || !a[0]) throw INVALID_PARAMS(`${m}: params[0] must be a base58 string`); };
 
   /** compute-unit prices (microlamports) of non-vote txs in the latest confirmed block(s), optionally only txs touching `keys` */
@@ -125,13 +131,15 @@ export function createSolanaApi(opts: SolanaApiOptions = {}) {
     const slot: number = await up("getSlot", [{ commitment: "confirmed" }], chain.slots(1));
     const want = new Set(keys); const out: number[] = [];
     for (let s = slot, tries = 0; tries < 4 && out.length < 50; s--, tries++) {
-      let b: any; try { b = await up("getBlock", [s, { encoding: "json", maxSupportedTransactionVersion: 1, transactionDetails: "full", rewards: false, commitment: "confirmed" }], 10_000); } catch { continue; }
+      let b: any; try { b = await up("getBlock", [s, { encoding: "json", maxSupportedTransactionVersion: MAX_TX_VERSION, transactionDetails: "full", rewards: false, commitment: "confirmed" }], 10_000); } catch { continue; }
       for (const t of b?.transactions ?? []) {
         const m = t.transaction?.message; if (!m) continue;
         const ks: string[] = [...m.accountKeys, ...(t.meta?.loadedAddresses?.writable ?? []), ...(t.meta?.loadedAddresses?.readonly ?? [])];
         if (want.size && !ks.some((k) => want.has(k))) continue;
         let price = -1;
         for (const ix of m.instructions) { if (ks[ix.programIdIndex] !== CB) continue; try { const d = b58decode(ix.data); if (d[0] === 3 && d.length >= 9) price = Number(d.readBigUInt64LE(1)); } catch {} }
+        const tc = m.transactionConfig; // v1: fee lives in the message (total lamports), not ComputeBudget ixs
+        if (price < 0 && tc && tc.priorityFee != null && tc.computeUnitLimit) price = Math.floor(Number(tc.priorityFee) * 1e6 / Number(tc.computeUnitLimit));
         if (price >= 0) out.push(price); // only txs that explicitly set a CU price
       }
     }
@@ -196,7 +204,7 @@ export function createSolanaApi(opts: SolanaApiOptions = {}) {
       if (!Array.isArray(a[0]) || a[0].length === 0) throw INVALID_PARAMS("getMultipleAccounts: params[0] must be a non-empty array");
       if (a[0].length > 100) throw INVALID_PARAMS("getMultipleAccounts: max 100 pubkeys");
     }),
-    getTransaction: pass("getTransaction", 60_000, needKey("getTransaction")),
+    getTransaction: pass("getTransaction", 60_000, (a) => { needKey("getTransaction")(a); txv(a); }),
     getSignaturesForAddress: pass("getSignaturesForAddress", slotTtl(2), (a) => {
       needKey("getSignaturesForAddress")(a);
       if (a[1]?.limit != null && (a[1].limit < 1 || a[1].limit > 1000)) throw INVALID_PARAMS("getSignaturesForAddress: limit must be 1..1000");
@@ -204,7 +212,7 @@ export function createSolanaApi(opts: SolanaApiOptions = {}) {
     getSignatureStatuses: pass("getSignatureStatuses", 0, (a) => {
       if (!Array.isArray(a[0]) || a[0].length > 256) throw INVALID_PARAMS("getSignatureStatuses: params[0] must be an array of <=256 signatures");
     }),
-    getBlock: pass("getBlock", 60_000, (a) => { if (!Number.isInteger(a[0])) throw INVALID_PARAMS("getBlock: params[0] must be a slot number"); }),
+    getBlock: pass("getBlock", 60_000, (a) => { if (!Number.isInteger(a[0])) throw INVALID_PARAMS("getBlock: params[0] must be a slot number"); txv(a); }),
     getBlockTime: pass("getBlockTime", 60_000),
     getTokenAccountsByOwner: pass("getTokenAccountsByOwner", slotTtl(2), (a) => {
       needKey("getTokenAccountsByOwner")(a);

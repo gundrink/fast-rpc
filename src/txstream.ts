@@ -1,7 +1,7 @@
 // Transaction stream built on shared logsSubscribe topics + getTransaction fetch (Helius transactionSubscribe-like).
 import type { StreamHub, Entry } from "./stream.js";
 import { INVALID_PARAMS } from "./errors.js";
-import { decodeTransaction, isPubkey } from "./codec.js";
+import { decodeTransaction, isPubkey, MAX_TX_VERSION } from "./codec.js";
 
 export const VOTE_PROGRAM = "Vote111111111111111111111111111111111111111";
 export interface TxFilter { accountInclude?: string[]; accountExclude?: string[]; accountRequired?: string[]; vote?: boolean; failed?: boolean; signature?: string }
@@ -115,7 +115,7 @@ export class TxWatcher {
     }
   }
   private async fetch(sig: string) {
-    const cfg = { encoding: this.opts.encoding ?? "json", commitment: this.opts.commitment ?? this.hub.chain.defaultCommitment, maxSupportedTransactionVersion: this.opts.maxSupportedTransactionVersion ?? 0 };
+    const cfg = { encoding: this.opts.encoding ?? "json", commitment: this.opts.commitment ?? this.hub.chain.defaultCommitment, maxSupportedTransactionVersion: Math.max(this.opts.maxSupportedTransactionVersion ?? 0, MAX_TX_VERSION) };
     for (let i = 0; i <= this.cfg.retries; i++) {
       try { const r = await this.getTx(sig, cfg); if (r) return r; } catch {}
       if (this.stopped) return null;

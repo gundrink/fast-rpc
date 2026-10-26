@@ -23,7 +23,7 @@ export function createSender(d: SenderDeps) {
     const sig = dec.signatures[0];
     if (!sig || /^1+$/.test(sig)) throw INVALID_PARAMS("sendTransactionWithRetry: transaction is not signed");
     const wire = enc === "base64" ? Buffer.from(tx, "base64") : b58decode(tx);
-    const raw = await rawBlockhash(wire);
+    const raw = dec.recentBlockhash ?? await rawBlockhash(wire);
     // Alpenglow: confirmed == finalized (~150ms), so default target is chain.defaultCommitment
     const target = d.chain.mapCommitment(cfg.commitment ?? d.chain.defaultCommitment);
     const every = cfg.rebroadcastMs ?? Math.max(100, Math.round(d.chain.slots(2)));

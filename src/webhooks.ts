@@ -4,7 +4,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { StreamHub } from "./stream.js";
 import { TxWatcher, type GetTx } from "./txstream.js";
-import { isPubkey } from "./codec.js";
+import { isPubkey, MAX_TX_VERSION } from "./codec.js";
 import { parseEnhanced, TX_TYPES } from "./enhanced.js";
 
 export interface Webhook { webhookID: string; wallet: string; webhookURL: string; transactionTypes: string[]; accountAddresses: string[]; webhookType: "raw" | "rawDevnet" | "enhanced" | "enhancedDevnet"; authHeader?: string; txnStatus?: "all" | "success" | "failed"; active?: boolean }
@@ -82,7 +82,7 @@ export class WebhookManager {
     const ordered = [...sigs].sort((x, y) => x[1] - y[1]);
     let n = 0;
     for (const [sig] of ordered) {
-      const r = await rpc("getTransaction", [sig, { encoding: "json", maxSupportedTransactionVersion: 0, commitment: "confirmed" }]).catch(() => null);
+      const r = await rpc("getTransaction", [sig, { encoding: "json", maxSupportedTransactionVersion: MAX_TX_VERSION, commitment: "confirmed" }]).catch(() => null);
       if (r && this.handle(h, r)) n++;
     }
     this.st(h.webhookID).backfilled = (this.st(h.webhookID).backfilled ?? 0) + n; this.saveState();

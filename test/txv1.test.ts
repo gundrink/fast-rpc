@@ -62,7 +62,7 @@ test("race: provider-gated -32602 / -32601 fail over to the next upstream (no co
 test("transactionSubscribe: processed commitment fetches with confirmed (getTransaction rejects processed) and v1", async () => {
   const { TxWatcher, ChainState } = await import("../src/index.js");
   const seen: any[] = [];
-  const hub: any = { chain: new ChainState(), upstream: {}, subscribe: () => () => {} };
+  const hub: any = { chain: new ChainState(), upstream: {}, subscribe: () => ({ detach: () => {} }) };
   const w = new TxWatcher(hub, async (_s: string, cfg: any) => { seen.push(cfg); return { slot: 1 }; }, { accountInclude: ["A"] }, { commitment: "processed", maxSupportedTransactionVersion: 0 }, () => {});
   await (w as any).fetch("sig");
   assert.equal(seen[0].commitment, "confirmed"); assert.equal(seen[0].maxSupportedTransactionVersion, 1);

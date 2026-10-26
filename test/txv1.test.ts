@@ -44,3 +44,17 @@ test("priority fee: v1 txs (transactionConfig.priorityFee, no ComputeBudget ix) 
     assert.equal(r.source, "recentBlocks"); assert.equal(r.priorityFeeLevels.unsafeMax, 200_000); // 200 lamports / 1000 CU = 200k µL/CU
   } finally { await a.close(); await m.close(); }
 });
+
+test("race: provider-gated -32602 / -32601 fail over to the next upstream (no cooldown)", async () => {
+  const { createRacedUpstream, RpcError } = await import("../src/index.js");
+  const calls: string[] = [];
+  const make = (u: string) => async (m: string) => { calls.push(u);
+    if (u === "a") throw new RpcError(-32602, "Indexed requests require a personal token. Get one at: https://x");
+    if (u === "b") throw new RpcError(-32601, "Method not found");
+    return 42; };
+  const r = createRacedUpstream(["a", "b", "c"], { make, hedgeMs: 10_000 });
+  assert.equal(await r("getTokenSupply", ["x"]), 42);
+  assert.ok(r.stats().every((s: any) => s.healthy)); // gated answers do not mark upstreams down
+  const r2 = createRacedUpstream(["p"], { make: () => async () => { throw new RpcError(-32602, "Invalid param: bad pubkey"); } });
+  await assert.rejects(r2("getBalance", ["x"]), /Invalid param/); // real param errors still surface
+});

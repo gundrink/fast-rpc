@@ -6,7 +6,10 @@ import { RpcError } from "./errors.js";
 export type RaceUpstream = (method: string, params?: any[], ttlMs?: number) => Promise<any>;
 export interface RaceOptions { rounds?: number; hedgeMs?: number; cooldownMs?: number; fanout?: number; timeoutMs?: number; make?: (url: string) => RaceUpstream }
 /** JSON-RPC error codes that are a real answer (not an upstream fault) — do not retry elsewhere. */
-const ANSWER = new Set([-32602, -32601, -32600, -32002, -32003, -32004, -32007, -32009, -32014, -32016]);
+const ANSWER = new Set([-32602, -32600, -32002, -32003, -32004, -32007, -32009, -32014, -32016]);
+
+/** provider gating dressed up as a param error (e.g. publicnode "Indexed requests require a personal token"): try the next upstream */
+const GATED = /personal token|api[- ]?key|requires? (a )?(paid|plan|subscription|token)|not available on this|disabled on this|upgrade your plan/i;
 
 export function createRacedUpstream(urls: string[], o: RaceOptions = {}) {
   const hedgeMs = o.hedgeMs ?? Number(process.env.RACE_HEDGE_MS ?? 150);
@@ -28,8 +31,10 @@ export function createRacedUpstream(urls: string[], o: RaceOptions = {}) {
           if (!done) { done = true; timers.forEach(clearTimeout); resolve(v); }
         }, (e) => {
           pending--;
-          if (e instanceof RpcError && ANSWER.has(e.code)) { if (!done) { done = true; timers.forEach(clearTimeout); reject(e); } return; }
-          u.fail++; u.downUntil = Date.now() + cooldown; lastErr = e;
+          if (e instanceof RpcError && ANSWER.has(e.code) && !GATED.test(e.message ?? "")) { if (!done) { done = true; timers.forEach(clearTimeout); reject(e); } return; }
+          // method blocked / gated on this provider: try the next one without marking it unhealthy
+          const soft = e instanceof RpcError && (e.code === -32601 || GATED.test(e.message ?? ""));
+          if (!soft) { u.fail++; u.downUntil = Date.now() + cooldown; } lastErr = e;
           if (!done && i < order.length) { timers.forEach(clearTimeout); launch(); }
           else if (!done && pending === 0 && i >= order.length) { done = true; reject(lastErr); }
         });

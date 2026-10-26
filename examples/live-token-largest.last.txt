@@ -1,0 +1,11 @@
+2026-10-26T15:22:38.386Z https://fast-rpc-production.up.railway.app
+info  pump.fun Token-2022 mint from tx bwF3DdoJGiRT…: 3fzrATrGzvi9mF7QeqN7K5HXa9VYqFBv9BHg2CSCpump
+PASS  getTokenLargestAccounts pump.fun Token-2022      3635ms  n=20 top=831942259.058579 dec=6 via api.mainnet-beta.solana.com scanned=20
+PASS    cached repeat                                  1921ms  
+PASS    cross-check top via getTokenAccountBalance        0ms  829436602444071 vs 831942259058579 (moved since scan)
+PASS  getTokenLargestAccounts BONK (classic SPL)      17078ms  n=20 top=7770515063166.43106 dec=5 via api.mainnet-beta.solana.com scanned=2095099
+FAIL    cached repeat                                  2454ms  
+PASS    cross-check top via getTokenAccountBalance        0ms  777051506316643106 vs 777051506316643106 (equal)
+FAIL  getLargestAccounts (best effort)                30746ms  429 Too many requests for a specific RPC call
+PASS  getTpuStatus (allowSend on)                      1154ms  {"enabled":true,"allowSend":true,"identity":"CoF549zAkiAAFXXYuR2AGkoPSxZAVJnxibK8tv9PE24","fanout":4}
+PASS  getTpuHandshake                                   769ms  4/4 ms=96/3/16/38

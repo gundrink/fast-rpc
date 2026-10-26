@@ -224,15 +224,15 @@ export function createSolanaApi(opts: SolanaApiOptions = {}) {
     getStakeMinimumDelegation: pass("getStakeMinimumDelegation", 60_000),
     getSupply: pass("getSupply", 30_000),
     /** native first (short budget); public RPCs block it, so fall back to a streamed getProgramAccounts top-20 */
+    /** native first (short budget, inside the cache); public RPCs block it, so fall back to a streamed getProgramAccounts top-20 */
     getTokenLargestAccounts: async (...a: any[]) => {
       const p = clean(a); needKey("getTokenLargestAccounts")(p);
-      if (process.env.TOKEN_LARGEST_NATIVE !== "0") {
+      const native = process.env.TOKEN_LARGEST_NATIVE === "0" ? undefined : async (mint: string, cfg: any) => {
         try {
-          const v = await Promise.race([up("getTokenLargestAccounts", p, 10_000), new Promise((_, rej) => setTimeout(() => rej(new Error("native timeout")), Number(process.env.TOKEN_LARGEST_NATIVE_MS ?? 1500)))]);
-          return v;
-        } catch (e: any) { if (e instanceof RpcError && e.code === -32602 && !/blocked|token|disabled/i.test(e.message)) throw e; }
-      }
-      return (tokenLargest ??= createTokenLargest((m, q) => up(m, q, 0), { urls: urls.length ? urls : [opts.url ?? upstreamUrl], fetcher: opts.fetcher }))(p[0], p[1] ?? {});
+          return await Promise.race([up("getTokenLargestAccounts", [mint, ...(cfg.commitment ? [cfg] : [])], 10_000), new Promise((_, rej) => setTimeout(() => rej(new Error("native timeout")), Number(process.env.TOKEN_LARGEST_NATIVE_MS ?? 1500)))]);
+        } catch (e: any) { if (e instanceof RpcError && e.code === -32602 && !/blocked|token|disabled/i.test(e.message)) throw e; return undefined; }
+      };
+      return (tokenLargest ??= createTokenLargest((m, q) => up(m, q, 0), { urls: urls.length ? urls : [opts.url ?? upstreamUrl], fetcher: opts.fetcher, native }))(p[0], p[1] ?? {});
     },
     getTokenAccountsByDelegate: pass("getTokenAccountsByDelegate", slotTtl(2), needKey("getTokenAccountsByDelegate")),
     getTransactionCount: pass("getTransactionCount", 0),

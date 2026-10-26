@@ -39,3 +39,9 @@ test("createTokenLargest: Token vs Token-2022 filters, decimals, failover, cache
   await f(M22); const last = seen.at(-1).b.params; assert.equal(last[0], "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"); assert.deepEqual(last[1].filters, [{ memcmp: { offset: 0, bytes: M22 } }]);
   await assert.rejects(f("not-a-key"), /base58/);
 });
+
+test("createTokenLargest: native answer wins and is cached; undefined falls back", async () => {
+  let nat = 0, fetched = 0; const NATIVE = { context: { slot: 1 }, value: [] };
+  const f = createTokenLargest(async () => ({}), { urls: ["http://x"], fetcher: (async () => { fetched++; throw new Error("no"); }) as any, native: async () => { nat++; return NATIVE; } });
+  const m = pk(); assert.equal(await f(m), NATIVE); await f(m); assert.equal(nat, 1); assert.equal(fetched, 0);
+});

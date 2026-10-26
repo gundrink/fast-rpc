@@ -6,7 +6,7 @@ import { isPubkey } from "./codec.js";
 const TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 type Rpc = (method: string, params: any[]) => Promise<any>;
-export interface LargestOptions { urls: string[]; fetcher?: typeof fetch; top?: number; ttlMs?: number; timeoutMs?: number; maxBytes?: number }
+export interface LargestOptions { urls: string[]; fetcher?: typeof fetch; top?: number; ttlMs?: number; timeoutMs?: number; maxBytes?: number; /** try the native method first; return undefined to fall back */ native?: (mint: string, cfg: any) => Promise<any> }
 
 const ITEM = /"pubkey":"([1-9A-HJ-NP-Za-km-z]{32,44})","account":\{[^{}]*?"data":\["([A-Za-z0-9+/=]*)"/g;
 const ITEM_REV = /"account":\{[^{}]*?"data":\["([A-Za-z0-9+/=]*)"[^{}]*\},"pubkey":"([1-9A-HJ-NP-Za-km-z]{32,44})"/g;
@@ -39,6 +39,7 @@ export function createTokenLargest(rpc: Rpc, o: LargestOptions) {
   const fetcher = o.fetcher ?? fetch; const top = o.top ?? 20; const ttl = o.ttlMs ?? Number(process.env.TOKEN_LARGEST_TTL_MS ?? 60_000);
   const cache = new Map<string, { at: number; v: any }>(); const inflight = new Map<string, Promise<any>>();
   async function compute(mint: string, commitment?: string) {
+    if (o.native) { const v = await o.native(mint, commitment ? { commitment } : {}); if (v !== undefined) return v; }
     const info = await rpc("getAccountInfo", [mint, { encoding: "jsonParsed", ...(commitment ? { commitment } : {}) }]);
     const acc = info?.value; if (!acc) throw INVALID_PARAMS("Invalid param: could not find mint");
     const program = acc.owner; const decimals = acc.data?.parsed?.info?.decimals;

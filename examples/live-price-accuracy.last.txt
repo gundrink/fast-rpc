@@ -1,0 +1,9 @@
+event counts by venue:validity {"curve:valid":1718,"curve:nonSolQuote":202,"amm:valid":4580,"amm-other:nonCanonicalPool":4419,"amm-other:nonSolPool":244,"curve:outlier":6}
+curve (event realTokenReserves vs curve token account): {"n":40,"within0_1pct":40,"within1pct":40,"p50":"0.0000%","max":"0.0000%"}
+amm (event price vs pool vault balances): {"n":40,"within0_1pct":39,"within1pct":40,"p50":"0.0000%","max":"0.3080%"}
+outlier sample {"sig":"3oH2cKdicwSoanKGtj51hnvpFKVwzXxnb3DBtsGhok77T8S5o4mFbfdXd9YUr4TomchZh9KTfgUzenYcRCdUhEJh","mint":"DhDDqXacY2KpDhsAGR1oGyFC6YnyhvNgz4XXFJrHpump","price":5.719179962101552e-9,"sol":0.025507779,"side":"sell"}
+outlier sample {"sig":"5yaxp4i6zBT5Pj9BNYaxquCtZ3GDWQk8vbXEv4oZNGfxAAJv5r8JJww9RHFvtqJWDU9bacdpyJPg7A1HNbDFnhqa","mint":"DhDDqXacY2KpDhsAGR1oGyFC6YnyhvNgz4XXFJrHpump","price":5.029322783222764e-9,"sol":0.010577725,"side":"sell"}
+outlier sample {"sig":"5JayDiKJTZAidQccJ3p439ibhLfw7UFafBkvYci9qpKunyEDUhrxAYdLg829gDD54jshBrypVb4aqqHHPub5i8hG","mint":"mWznPrqTyMeKjuTgG4gZz5U6VS8nr7PF4LACVHppump","price":9.044103125612054e-9,"sol":0.021582329,"side":"sell"}
+outlier sample {"sig":"4veNQXaxfW1FLZXxLtmNXv5RqM5vnkfFBm3XmPxzzDdMfcu8WH217XD4G88YWicfNzDVnWocAFtjxaUyTutSfjWi","mint":"mWznPrqTyMeKjuTgG4gZz5U6VS8nr7PF4LACVHppump","price":9.045926580160282e-9,"sol":0.000977777,"side":"buy"}
+outlier sample {"sig":"UhAgMsvzzXQBGQY4bYu2D3ZPkz4Wx111uS5p2SdJfABXYmqrvDAkwfMUpPckUDJUMF5mLxg9JHK3qMkH3L6gnXd","mint":"mWznPrqTyMeKjuTgG4gZz5U6VS8nr7PF4LACVHppump","price":7.38550577853228e-9,"sol":0.008626566,"side":"sell"}
+unverifiable samples: 0

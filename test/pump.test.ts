@@ -2,7 +2,7 @@ import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import WebSocket from "ws";
-import { stepBasis, createFastRpc, decodePumpTrade, decodeAmmEvent, parsePumpLogs, decodeBondingCurve, curveMetrics, curvePda, PUMP_DISC, b58decode, WSOL } from "../src/index.js";
+import { stepBasis, createFastRpc, decodePumpTrade, decodeAmmEvent, parsePumpLogs, decodeBondingCurve, curveMetrics, curvePda, PUMP_DISC, b58decode, WSOL, ammEvent, decodePythPrice } from "../src/index.js";
 import { startMockSolana, waitFor } from "./helpers.js";
 
 const fx = JSON.parse(fs.readFileSync(new URL("./fixtures/pump-logs.json", import.meta.url), "utf8"));
@@ -98,7 +98,7 @@ test("WS drawdown tracking: high/drawdown fields, firstTag basis follows the min
   assert.equal(got.find((m) => m.id === 2).error.code, -32602);
   let i = 0;
   const trade = (user: string, vsolSol: number) => mock.emit("logsSubscribe", { context: { slot: 10 + i }, value: { signature: `D${i++}`, err: null,
-    logs: [tradeLog({ mint: MINT, user, buy: true, sol: 1n, tok: 1n, vsol: BigInt(vsolSol * 1e9), vtok: 1_000_000_000_000_000n, rtok: 700_000_000_000_000n })] } });
+    logs: [tradeLog({ mint: MINT, user, buy: true, sol: 1_000_000_000n, tok: 1n, vsol: BigInt(vsolSol * 1e9), vtok: 1_000_000_000_000_000n, rtok: 700_000_000_000_000n })] } });
   trade(W, 30); await waitFor(() => got.some((m) => m.params?.result?.signature === "D0"));
   for (const v of [26, 23, 24.5, 33, 29]) { trade(O, v); await waitFor(() => got.some((m) => m.params?.result?.signature === `D${i - 1}` && m.params.result.type === "swap")); }
   await new Promise((r) => setTimeout(r, 100));
@@ -111,5 +111,46 @@ test("WS drawdown tracking: high/drawdown fields, firstTag basis follows the min
   assert.deepEqual(dd.map((a) => `${a.basis}:${a.threshold}`), ["subscribe:10", "firstTag:10", "subscribe:20", "firstTag:20", "subscribe:10", "firstTag:10"]);
   assert.equal(al.filter((a) => a.type === "rebound").length, 2);
   assert.equal(dd[0].mint, MINT); assert.ok(dd[0].high > dd[0].price);
+  ws.close(); await app.close();
+});
+
+test("ammEvent: WSOL as quote vs base orientation, non-SOL / non-canonical / no-pool validity", () => {
+  const T = "So11111111111111111111111111111111111111112".replace(/^So1+2$/, "TokenMint1111111111111111111111111111111111");
+  const t = { user: "U", pool: "P", buy: true, timestamp: 1n, baseAmount: 1_000_000n, quoteAmount: 2_000_000_000n, baseAfter: 500_000_000_000n, quoteAfter: 50_000_000_000n } as any;
+  const q = ammEvent(t, { base: T, quote: WSOL, baseDec: 6, quoteDec: 9, canonical: true }, "s", 1, 0);
+  assert.equal(q.mint, T); assert.equal(q.side, "buy"); assert.equal(q.solAmount, 2); assert.equal(q.venue, "amm"); assert.equal(q.priceValid, true);
+  assert.ok(Math.abs(q.price! - 50 / 500_000) < 1e-15);
+  // WSOL as base: base side is SOL, buying base (SOL) == selling the token
+  const b = ammEvent({ ...t, baseAfter: 50_000_000_000n, quoteAfter: 500_000_000_000n }, { base: WSOL, quote: T, baseDec: 9, quoteDec: 6, canonical: false }, "s", 1, 0);
+  assert.equal(b.mint, T); assert.equal(b.side, "sell"); assert.equal(b.solAmount, 0.001); assert.equal(b.venue, "amm-other");
+  assert.equal(b.priceValid, false); assert.equal(b.priceInvalidReason, "nonCanonicalPool"); assert.ok(Math.abs(b.price! - 50 / 500_000) < 1e-15);
+  const n = ammEvent(t, { base: T, quote: "Other", baseDec: 6, quoteDec: 6, canonical: false }, "s", 1, 0);
+  assert.equal(n.priceValid, false); assert.equal(n.priceInvalidReason, "nonSolPool"); assert.equal(n.price, null);
+  assert.equal(ammEvent(t, null, "s", 1, 0).priceInvalidReason, "noPool");
+  const d = ammEvent(t, { base: T, quote: WSOL, baseDec: null, quoteDec: 9, canonical: true }, "s", 1, 0);
+  assert.equal(d.priceInvalidReason, "badReserves");
+});
+
+test("decodePythPrice: PriceUpdateV2 layout", () => {
+  const b = Buffer.alloc(134); b[40] = 1; const o = 41 + 32;
+  b.writeBigInt64LE(9915000000n, o); b.writeBigUInt64LE(5000000n, o + 8); b.writeInt32LE(-8, o + 16); b.writeBigInt64LE(1700000000n, o + 20);
+  const v = decodePythPrice(b)!; assert.ok(Math.abs(v.price - 99.15) < 1e-9); assert.equal(v.publishTime, 1700000000);
+});
+
+test("outlier guard (rolling median, regime change) + dust flag", async () => {
+  const app = createFastRpc({ api: { url: mock.httpUrl }, hub: { wsUrl: mock.wsUrl, lingerMs: 50 }, webhooks: false, chain: { detect: false } });
+  const port = await app.server.listen(0);
+  const ws = new WebSocket(`ws://127.0.0.1:${port}`); await new Promise((r) => ws.on("open", r));
+  const got: any[] = []; ws.on("message", (d) => got.push(JSON.parse(String(d))));
+  ws.send(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "pumpSwapSubscribe", params: [{ mints: [MINT], position: false }] }));
+  await waitFor(() => got.some((m) => m.id === 1) && mock.activeSubs("logsSubscribe") >= 1);
+  let i = 0; const U = "DbPzFfzmaFq1KHyqUk4SrfvQnXVokyui9sJg4a2JW8SK";
+  const seq: [number, bigint][] = [[30, 10_000_000n], [30, 10_000_000n], [31, 10_000_000n], [300, 10_000_000n], [30, 1n], [3, 10_000_000n], [3.1, 10_000_000n], [3, 10_000_000n], [3.05, 10_000_000n]];
+  for (const [v, sol] of seq) { const s = `O${i++}`; mock.emit("logsSubscribe", { context: { slot: 100 + i }, value: { signature: s, err: null,
+    logs: [tradeLog({ mint: MINT, user: U, buy: true, sol, tok: 1n, vsol: BigInt(Math.round(v * 1e9)), vtok: 1_000_000_000_000_000n, rtok: 700_000_000_000_000n })] } });
+    await waitFor(() => got.some((m) => m.params?.result?.signature === s)); }
+  const sw = got.filter((m) => m.method === "pumpSwapNotification").map((m) => m.params.result).filter((e) => e.type === "swap");
+  assert.deepEqual(sw.map((e) => e.priceValid), [true, true, true, false, true, false, false, true, true]);
+  assert.equal(sw[3].priceInvalidReason, "outlier"); assert.equal(sw[4].dust, true); assert.equal(sw[0].venue, "curve"); assert.equal(sw[0].priceSource, "curveEventReserves");
   ws.close(); await app.close();
 });

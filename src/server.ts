@@ -427,13 +427,20 @@ export class RpcServer {
             const eng = this.pump;
             void eng.curvePrice(mint).then((c) => out("pumpCurveNotification", { ...c, source: "account" }), () => {});
             const cp = typeof p0 === "object" && p0 ? validatePumpParams({ mints: [mint], drawdownAlerts: p0.drawdownAlerts, reboundPct: p0.reboundPct }) : { mints: [mint] };
-            const stop = eng.subscribe({ ...cp, position: false }, (e: any) => {
+            let lastTrade: number | null = null;
+            // periodic cross-check: bonding-curve account price vs last valid trade-event price
+            const xc = setInterval(() => void eng.curvePrice(mint).then((c) => out("pumpCurveNotification", { ...c, source: "account", lastTradePrice: lastTrade,
+              deviationPct: lastTrade && c.price ? Math.round((c.price / lastTrade - 1) * 10_000) / 100 : null }), () => {}), Number(process.env.PUMP_CURVE_CHECK_MS ?? 15_000));
+            xc.unref?.();
+            const stop0 = eng.subscribe({ ...cp, position: false }, (e: any) => {
               if (e.mint !== mint) return;
+              if (e.type === "swap" && e.priceValid && e.venue === "curve") lastTrade = e.price;
               if (e.type !== "swap") { out("pumpCurveNotification", e); return; }
-              out("pumpCurveNotification", { mint, slot: e.slot, signature: e.signature, price: e.price, marketCapSol: e.marketCapSol, progress: e.progress, complete: e.program === "pumpswap" || (e.progress ?? 0) >= 100,
+              out("pumpCurveNotification", { mint, slot: e.slot, signature: e.signature, price: e.priceValid ? e.price : null, priceValid: e.priceValid, priceInvalidReason: e.priceInvalidReason, venue: e.venue, priceUsd: e.priceUsd ?? null, marketCapSol: e.marketCapSol, progress: e.progress, complete: e.venue === "amm" || e.complete === true,
                 virtualSolReserves: e.virtualSolReserves, virtualTokenReserves: e.virtualTokenReserves, realTokenReserves: e.realTokenReserves, program: e.program, side: e.side, commitment: e.commitment, source: "trade", receivedAt: e.receivedAt,
                 highSinceSubscribe: e.highSinceSubscribe ?? null, drawdownPct: e.drawdownPct ?? null, highSinceFirstTag: e.highSinceFirstTag ?? null, drawdownSinceTagPct: e.drawdownSinceTagPct ?? null });
             });
+            const stop = () => { clearInterval(xc); stop0(); };
             subs.set(sid, { type, detach: stop });
           }
           return { jsonrpc: "2.0", id, result: sid };

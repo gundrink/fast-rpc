@@ -3,3 +3,4 @@ dist/
 .env
 *.log
 tpu-sidecar/target/
+data/pump-analytics.json*

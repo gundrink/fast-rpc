@@ -11,6 +11,7 @@ export const WSOL = "So11111111111111111111111111111111111111112";
 /** Pyth SOL/USD price-feed account (pull oracle, sponsored feed) */
 export const PYTH_SOL_USD = "7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE";
 /** PriceUpdateV2: disc8, write_authority32, verification_level(1 byte Full | 2 bytes Partial), feed_id32, price i64, conf u64, expo i32, publish_time i64 */
+export interface LaunchRisk { creator: string | null; createSlot: number; creatorPct: number; bundleWallets: number; bundlePct: number; sameSlotBuys: number; earlyBuyers: number; sharedFunder?: { funder: string; wallets: number } | null; creatorFundedWallets?: number; score: number; final: boolean }
 export function decodePythPrice(b: Buffer) {
   if (b.length < 100) return null;
   const o = 40 + (b[40] === 0 ? 2 : 1) + 32;
@@ -33,6 +34,7 @@ class R { o = 8; constructor(public b: Buffer) {}
 }
 
 export interface PumpSwapEvent {
+  launchRisk?: LaunchRisk;
   signature: string; slot: number; blockTime: number | null; wallet: string; mint: string | null; side: "buy" | "sell";
   solAmount: number; tokenAmount: number; solAmountRaw: string; tokenAmountRaw: string;
   virtualSolReserves: string; virtualTokenReserves: string; price: number | null; create: boolean;
@@ -208,6 +210,12 @@ export class PumpEngine {
   }
   constructor(private hub: StreamHub, private rpc: Rpc, private opts: { commitment?: string; log?: (...a: any[]) => void; solUsd?: boolean } = {}) {}
 
+  /** analytics hooks: see every swap event (after validity/USD enrichment) before listeners; may add fields */
+  hooks: ((e: PumpSwapEvent) => void)[] = [];
+  /** first tag any current subscriber gave this wallet */
+  tagOf(wallet: string): string | undefined { for (const l of this.ls) { const t = l.p.tags?.[wallet]; if (t) return t; } return undefined; }
+  /** wallets explicitly watched by current subscribers */
+  watched(wallet: string) { for (const l of this.ls) if (l.w?.has(wallet)) return true; return false; }
   subscribe(p: PumpSubParams, cb: (e: PumpSwapEvent) => void) {
     const l: Listener = { p, cb, tr: new Map(), agg: new Map(), pnl: new Map(), w: p.wallets?.length ? new Set(p.wallets) : undefined, m: p.mints?.length ? new Set(p.mints) : undefined };
     this.ls.add(l); this.ensure();
@@ -304,6 +312,7 @@ export class PumpEngine {
     this.guard(e);
     if (e.solAmount < 0.000_01 && e.priceValid) e.dust = true;
     if (this.solUsd) { e.solUsd = this.solUsd; e.priceUsd = e.priceValid && e.price != null ? e.price * this.solUsd : null; e.marketCapUsd = e.priceValid && e.marketCapSol != null ? e.marketCapSol * this.solUsd : null; }
+    for (const h of this.hooks) try { h(e); } catch {}
     const ls = [...this.ls].filter((l) => this.match(l, e)); if (!ls.length) { this.track(e); return; }
     const key = `${e.wallet}:${e.mint}`; const raw = BigInt(e.tokenAmountRaw);
     // pctOfPositionSold from tracked balance when we already know it (sync), else follow-up

@@ -7,3 +7,4 @@ export * from "./history.js";
 export * from "./fundedby.js"; export * from "./auth.js"; export * from "./race.js"; export * from "./sender.js"; export * from "./tpu.js";
 export * from "./tpu-sidecar.js";
 export * from "./pump.js";
+export * from "./pump-analytics.js";

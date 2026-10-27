@@ -1,4 +1,5 @@
 import { PumpEngine, validatePumpParams } from "./pump.js";
+import type { PumpAnalytics } from "./pump-analytics.js";
 import { isPubkey as isPk } from "./codec.js";
 import { parseTransactions, addressTransactions, HttpError } from "./history.js";
 import net from "node:net";
@@ -101,6 +102,13 @@ export class RpcServer {
   /** getTx enables transactionSubscribe (logs topics + getTransaction). */
   attachPump(p: PumpEngine) { this.pump = p; this.register("pumpCurvePrice", (mint: any) => p.curvePrice(mint)); return this; }
   private pump?: PumpEngine;
+  private analytics?: PumpAnalytics;
+  attachAnalytics(a: PumpAnalytics) {
+    this.analytics = a;
+    this.register("pumpWalletRanking", (q: any) => a.ranking(q ?? {}));
+    this.register("pumpLaunchInfo", (mint: any, cfg: any) => a.launchInfo(mint, cfg ?? {}));
+    return this;
+  }
   attachStreams(hub: StreamHub, getTx?: GetTx) { this.hub = hub; this.getTx = getTx; return this; }
   attachWebhooks(m: WebhookManager) { this.webhooks = m; return this; }
   attachChain(c: ChainState) { this.chain = c; return this; }
@@ -402,7 +410,7 @@ export class RpcServer {
     const send = (o: any) => { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(o)); };
 
     const one = async (r: any): Promise<JsonRpcReply | undefined> => {
-      const pm = typeof r?.method === "string" ? /^pump(Swap|Curve)(Subscribe|Unsubscribe)$/.exec(r.method) : null;
+      const pm = typeof r?.method === "string" ? /^pump(Swap|Curve|Ranking)(Subscribe|Unsubscribe)$/.exec(r.method) : null;
       if (pm && r.jsonrpc === "2.0") {
         const id = typeof r.id === "string" || typeof r.id === "number" ? r.id : null;
         const type = `pump${pm[1]}`;
@@ -417,7 +425,14 @@ export class RpcServer {
           const p0 = Array.isArray(r.params) ? r.params[0] : r.params;
           const sid = this.nextWsSub++;
           const out = (method: string, result: any) => { const g = bp(ws.bufferedAmount); if (g === "kill") { ws.terminate(); return; } if (g === "drop") return; send({ jsonrpc: "2.0", method, params: { subscription: sid, result } }); };
-          if (pm[1] === "Swap") {
+          if (pm[1] === "Ranking") {
+            if (!this.analytics) throw new RpcError(-32601, "pumpRankingSubscribe: analytics disabled (PUMP_ANALYTICS=1)");
+            const a = this.analytics; const q = { ...(p0 ?? {}) }; a.ranking(q); // validate
+            const every = Math.max(10, Math.min(3600, Number(q.intervalSec ?? 60))) * 1000;
+            const push = () => { try { out("pumpRankingNotification", a.ranking(q)); } catch {} };
+            const t = setInterval(push, every); t.unref?.(); setTimeout(push, 0);
+            subs.set(sid, { type, detach: () => clearInterval(t) });
+          } else if (pm[1] === "Swap") {
             const p = validatePumpParams(p0);
             const stop = this.pump.subscribe(p, (e) => out("pumpSwapNotification", e));
             subs.set(sid, { type, detach: stop });

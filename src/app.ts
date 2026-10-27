@@ -4,12 +4,15 @@ import { createSolanaApi, createUpstream, upstreamUrl, type SolanaApiOptions } f
 import { WebhookManager, type WebhookOptions } from "./webhooks.js";
 import { ChainState, type ChainOptions } from "./chain.js";
 import { PumpEngine } from "./pump.js";
+import { PumpAnalytics, type AnalyticsOptions } from "./pump-analytics.js";
 import { CnftIndexer, type IndexerOptions } from "./bubblegum.js";
 
 export interface FastRpcOptions {
   server?: ServerOptions; hub?: HubOptions; api?: SolanaApiOptions; webhooks?: WebhookOptions | false;
   /** compressed-NFT indexer (CNFT_TREES); backfill from creation when CNFT_BACKFILL=1 */
   cnft?: IndexerOptions & { backfill?: boolean };
+  /** wallet ranking + launch risk (pumpWalletRanking / pumpLaunchInfo / pumpRankingSubscribe); keeps the pump stream on */
+  pumpAnalytics?: AnalyticsOptions & { backfill?: boolean } | false;
   chain?: ChainOptions & {
     /** call getAgGenesisCert at start + every redetectMs (default true; CHAIN_DETECT=0 disables) */
     detect?: boolean; redetectMs?: number;
@@ -36,6 +39,11 @@ export function createFastRpc(opts: FastRpcOptions = {}) {
   const server = new RpcServer(opts.server).attachStreams(hub, getTx).registerAll(api).attachChain(chain);
   const pump = new PumpEngine(hub, rpc as any);
   server.attachPump(pump);
+  const analytics = opts.pumpAnalytics ? new PumpAnalytics(pump, rpc as any, opts.pumpAnalytics).start() : undefined;
+  if (analytics) {
+    server.attachAnalytics(analytics);
+    if ((opts.pumpAnalytics as any).backfill && opts.pumpAnalytics && opts.pumpAnalytics.wallets) void analytics.backfill([...opts.pumpAnalytics.wallets.keys()], { log: console.log }).catch(() => {});
+  }
   if (webhooks) server.attachWebhooks(webhooks);
   const timers: NodeJS.Timeout[] = [];
   const detect = co.detect ?? process.env.CHAIN_DETECT !== "0";
@@ -44,7 +52,7 @@ export function createFastRpc(opts: FastRpcOptions = {}) {
   if (detect) { const t = setInterval(() => void chain.detect(detectUp), co.redetectMs ?? 600_000); t.unref(); timers.push(t); }
   const track = (co.trackSlots ?? process.env.CHAIN_TRACK_SLOTS === "1") ? hub.subscribe("slot", {}, { deliver: () => {} }) : undefined;
   return {
-    server, hub, api, pump, webhooks, chain, cnft, ready,
-    close: async () => { for (const t of timers) clearInterval(t); track?.detach(); webhooks?.close(); cnft.stop(); await server.close(); hub.close(); },
+    server, hub, api, pump, analytics, webhooks, chain, cnft, ready,
+    close: async () => { for (const t of timers) clearInterval(t); track?.detach(); webhooks?.close(); cnft.stop(); analytics?.close(); await server.close(); hub.close(); },
   };
 }

@@ -3,6 +3,7 @@ import { StreamHub, type HubOptions } from "./stream.js";
 import { createSolanaApi, createUpstream, upstreamUrl, type SolanaApiOptions } from "./solana.js";
 import { WebhookManager, type WebhookOptions } from "./webhooks.js";
 import { ChainState, type ChainOptions } from "./chain.js";
+import { PumpEngine } from "./pump.js";
 import { CnftIndexer, type IndexerOptions } from "./bubblegum.js";
 
 export interface FastRpcOptions {
@@ -33,6 +34,8 @@ export function createFastRpc(opts: FastRpcOptions = {}) {
       for (const [tree, t] of cnft.trees) if (t.seq === 0) void cnft.backfill(rpc, tree).catch((e) => opts.cnft?.log?.("[cnft] backfill failed", tree, e?.message));
   }
   const server = new RpcServer(opts.server).attachStreams(hub, getTx).registerAll(api).attachChain(chain);
+  const pump = new PumpEngine(hub, rpc as any);
+  server.attachPump(pump);
   if (webhooks) server.attachWebhooks(webhooks);
   const timers: NodeJS.Timeout[] = [];
   const detect = co.detect ?? process.env.CHAIN_DETECT !== "0";
@@ -41,7 +44,7 @@ export function createFastRpc(opts: FastRpcOptions = {}) {
   if (detect) { const t = setInterval(() => void chain.detect(detectUp), co.redetectMs ?? 600_000); t.unref(); timers.push(t); }
   const track = (co.trackSlots ?? process.env.CHAIN_TRACK_SLOTS === "1") ? hub.subscribe("slot", {}, { deliver: () => {} }) : undefined;
   return {
-    server, hub, api, webhooks, chain, cnft, ready,
+    server, hub, api, pump, webhooks, chain, cnft, ready,
     close: async () => { for (const t of timers) clearInterval(t); track?.detach(); webhooks?.close(); cnft.stop(); await server.close(); hub.close(); },
   };
 }

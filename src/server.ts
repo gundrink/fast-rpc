@@ -1,3 +1,5 @@
+import { PumpEngine, validatePumpParams } from "./pump.js";
+import { isPubkey as isPk } from "./codec.js";
 import { parseTransactions, addressTransactions, HttpError } from "./history.js";
 import net from "node:net";
 import http from "node:http";
@@ -97,6 +99,8 @@ export class RpcServer {
   register(name: string, fn: Handler) { this.handlers.set(name, fn); return this; }
   registerAll(api: Record<string, Handler>) { for (const [k, fn] of Object.entries(api)) this.register(k, fn); return this; }
   /** getTx enables transactionSubscribe (logs topics + getTransaction). */
+  attachPump(p: PumpEngine) { this.pump = p; this.register("pumpCurvePrice", (mint: any) => p.curvePrice(mint)); return this; }
+  private pump?: PumpEngine;
   attachStreams(hub: StreamHub, getTx?: GetTx) { this.hub = hub; this.getTx = getTx; return this; }
   attachWebhooks(m: WebhookManager) { this.webhooks = m; return this; }
   attachChain(c: ChainState) { this.chain = c; return this; }
@@ -390,7 +394,7 @@ export class RpcServer {
 
   // ---------- Solana-compatible JSON-RPC WebSocket (Helius/Solana pubsub) ----------
   private onWs(ws: WebSocket, key = "anonymous") {
-    const subs = new Map<number, { type: StreamType | "transaction"; detach: () => void }>();
+    const subs = new Map<number, { type: StreamType | "transaction" | string; detach: () => void }>();
     let alive = true;
     const bp = gate(this.o, this.stats);
     const ping = setInterval(() => { if (!alive) { ws.terminate(); return; } alive = false; ws.ping(); }, this.o.wsPingMs);
@@ -398,6 +402,40 @@ export class RpcServer {
     const send = (o: any) => { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(o)); };
 
     const one = async (r: any): Promise<JsonRpcReply | undefined> => {
+      const pm = typeof r?.method === "string" ? /^pump(Swap|Curve)(Subscribe|Unsubscribe)$/.exec(r.method) : null;
+      if (pm && r.jsonrpc === "2.0") {
+        const id = typeof r.id === "string" || typeof r.id === "number" ? r.id : null;
+        const type = `pump${pm[1]}`;
+        if (pm[2] === "Unsubscribe") {
+          const sid = Array.isArray(r.params) ? r.params[0] : undefined; const s = subs.get(sid);
+          if (!s || s.type !== type) return rpcErr(id, -32602, "Invalid subscription id.");
+          s.detach(); subs.delete(sid); return { jsonrpc: "2.0", id, result: true };
+        }
+        if (!this.pump) return rpcErr(id, -32601, "Method not found");
+        try { this.o.limiter.take(key, "subscribe"); } catch (e: any) { return rpcErr(id, e.code, e.message); }
+        try {
+          const p0 = Array.isArray(r.params) ? r.params[0] : r.params;
+          const sid = this.nextWsSub++;
+          const out = (method: string, result: any) => { const g = bp(ws.bufferedAmount); if (g === "kill") { ws.terminate(); return; } if (g === "drop") return; send({ jsonrpc: "2.0", method, params: { subscription: sid, result } }); };
+          if (pm[1] === "Swap") {
+            const p = validatePumpParams(p0);
+            const stop = this.pump.subscribe(p, (e) => out("pumpSwapNotification", e));
+            subs.set(sid, { type, detach: stop });
+          } else {
+            const mint = typeof p0 === "string" ? p0 : p0?.mint;
+            if (!isPk(mint)) throw new RpcError(-32602, "pumpCurveSubscribe: params [mint]");
+            const eng = this.pump;
+            void eng.curvePrice(mint).then((c) => out("pumpCurveNotification", { ...c, source: "account" }), () => {});
+            const stop = eng.subscribe({ mints: [mint], position: false }, (e) => {
+              if (e.mint !== mint) return;
+              out("pumpCurveNotification", { mint, slot: e.slot, signature: e.signature, price: e.price, marketCapSol: e.marketCapSol, progress: e.progress, complete: e.program === "pumpswap" || (e.progress ?? 0) >= 100,
+                virtualSolReserves: e.virtualSolReserves, virtualTokenReserves: e.virtualTokenReserves, realTokenReserves: e.realTokenReserves, program: e.program, side: e.side, commitment: e.commitment, source: "trade", receivedAt: e.receivedAt });
+            });
+            subs.set(sid, { type, detach: stop });
+          }
+          return { jsonrpc: "2.0", id, result: sid };
+        } catch (e: any) { return e instanceof RpcError ? rpcErr(id, e.code, e.message) : rpcErr(id, -32603, String(e?.message ?? e)); }
+      }
       const m = typeof r?.method === "string" ? SUB_RE.exec(r.method) : null;
       if (!m || r.jsonrpc !== "2.0") return this.rpcOne(r, key);
       const id = typeof r.id === "string" || typeof r.id === "number" ? r.id : null;

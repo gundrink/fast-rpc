@@ -4,3 +4,4 @@ dist/
 *.log
 tpu-sidecar/target/
 data/pump-analytics.json*
+data/pump-candles/

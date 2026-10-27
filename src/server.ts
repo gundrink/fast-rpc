@@ -457,7 +457,7 @@ export class RpcServer {
           } else if (pm[1] === "Swap") {
             const p = validatePumpParams(p0); const m = this.market;
             if (p.levels && !m) throw new RpcError(-32601, "pumpSwapSubscribe: levels needs pump market (PUMP_MARKET=1)");
-            const stop = this.pump.subscribe(p, (e: any) => out("pumpSwapNotification", p.levels && m && e.type === "swap" && e.mint ? { ...e, levels: m.levels(e.mint, e.priceValid ? e.price : null) } : e));
+            const stop = this.pump.subscribe(p, (e: any) => out("pumpSwapNotification", p.levels && m && e.type === "swap" && e.mint ? { ...e, levels: m.levels(e.mint, e.quoteMint ? e.priceQuote ?? null : e.priceValid ? e.price : null) } : e));
             subs.set(sid, { type, detach: stop });
           } else {
             const mint = typeof p0 === "string" ? p0 : p0?.mint;

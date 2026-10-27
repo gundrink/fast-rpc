@@ -111,6 +111,8 @@ test("WS drawdown tracking: high/drawdown fields, firstTag basis follows the min
   assert.deepEqual(dd.map((a) => `${a.basis}:${a.threshold}`), ["subscribe:10", "firstTag:10", "subscribe:20", "firstTag:20", "subscribe:10", "firstTag:10"]);
   assert.equal(al.filter((a) => a.type === "rebound").length, 2);
   assert.equal(dd[0].mint, MINT); assert.ok(dd[0].high > dd[0].price);
+  assert.ok(al.every((a) => typeof a.blockTime === "number" && a.blockTime > 1e9 && typeof a.slot === "number" && typeof a.signature === "string"), "alerts carry blockTime/slot/signature");
+  assert.ok(swaps.every((e) => e.liquiditySol >= 0 && e.liquidityBasis === "curveRealSol" && e.marketCapSol > 0), "curve liquidity + mcap");
   ws.close(); await app.close();
 });
 
@@ -195,4 +197,16 @@ test("nonSolFlip: token side of non-WSOL pools", async () => {
   const t: any = { pool: "P", user: "U", timestamp: 1n, buy: true, baseAmount: 1_000_000n, quoteAmount: 5_000_000n, baseAfter: 100_000_000n, quoteAfter: 500_000_000n, fee: 0n };
   const e = ammEvent(t, { base: XS, quote: TOK, baseDec: 8, quoteDec: 6, canonical: false }, "s", 1, 0);
   assert.equal(e.mint, TOK); assert.equal(e.side, "sell"); assert.equal(e.tokenAmount, 5);
+});
+
+test("liquidity: curve real SOL, pool SOL side x2, non-SOL quote converted, usd", async () => {
+  const { liquidity } = await import("../src/index.js");
+  const c: any = { mint: "M", program: "pump", realSolReserves: "5000000000", marketCapSol: 30, priceValid: true }; liquidity(c, 100);
+  assert.equal(c.liquiditySol, 5); assert.equal(c.liquidityUsd, 500); assert.equal(c.marketCapUsd, 3000);
+  const a: any = { mint: "M", program: "pumpswap", virtualSolReserves: "80000000000", marketCapSol: 400, priceValid: true }; liquidity(a, 100);
+  assert.equal(a.liquiditySol, 160); assert.equal(a.liquidityBasis, "poolSolX2");
+  const q: any = { mint: "M", program: "pumpswap", quoteMint: "Q", quoteReservesRaw: "1000000000", quoteDecimals: 6, quoteSolRate: 0.01, priceSol: 1e-7 }; liquidity(q, 100);
+  assert.equal(q.liquiditySol, 20); assert.equal(q.marketCapSol, 100); assert.equal(q.marketCapUsd, 10000);
+  const n: any = { mint: "M", program: "pump", quoteMint: "Q", quoteReservesRaw: "1", quoteDecimals: 6, quoteSolRate: null, priceSol: null, solEquivalentReason: "noSolRoute" }; liquidity(n, 100);
+  assert.equal(n.liquiditySol, null); assert.equal(n.liquidityReason, "noSolRoute");
 });

@@ -2,13 +2,23 @@
 import { PumpEngine, parsePumpLogs, curveMetrics, curvePda, ammEvent, solOf, type PumpSwapEvent } from "./pump.js";
 import { INVALID_PARAMS } from "./errors.js";
 import { isPubkey } from "./codec.js";
+import fs from "node:fs"; import path from "node:path";
 
 type Rpc = (m: string, p: any[]) => Promise<any>;
 export const INTERVALS = { "1s": 1, "5s": 5, "1m": 60 } as const;
 export type Interval = keyof typeof INTERVALS;
 const KEEP: Record<Interval, number> = { "1s": 900, "5s": 720, "1m": 1440 };
 export interface Candle { t: number; o: number; h: number; l: number; c: number; v: number; n: number }
-interface Series { mint: string; c: Record<Interval, Candle[]>; lastUse: number; backfill?: Promise<any>; backfilled?: { txs: number; trades: number; from: number | null; capped: boolean }; lv?: { at: number; v: any }; venue?: string; pool?: string; quoteMint?: string }
+interface Hist { trades: { ts: number; p: number; v: number; sig?: string }[]; sigs: Set<string>; newest: string | null; oldest: string | null; oldestTs?: number | null; historyEnd: boolean; txs: number; txMissing: number; fromDisk: number }
+interface Job { maxTx: number; fromMs?: number; done: boolean; fetched: number; truncated: null | "maxTx" | "rateLimited" | "signaturesError"; p: Promise<any> }
+interface Series { mint: string; c: Record<Interval, Candle[]>; lastUse: number; h?: Hist; job?: Job; addr?: string; unit?: "SOL" | "quote"; lv?: { at: number; v: any }; venue?: string; pool?: string; quoteMint?: string }
+const MAX_TRADES = 50_000;
+/** candles from raw trades in [fromMs, toMs] */
+export function buildCandles(trades: { ts: number; p: number; v: number }[], sec: number, fromMs: number, toMs: number) {
+  const out: Candle[] = [];
+  for (const t of trades) { if (t.ts < fromMs || t.ts > toMs) continue; addCandle(out, sec * 1000, t.ts, t.p, t.v, Infinity); }
+  return out;
+}
 const r6 = (x: number) => Math.round(x * 1e6) / 1e6;
 
 /** add a trade to a candle series (sorted by t; out-of-order backfill inserts) */
@@ -40,7 +50,7 @@ export function computeLevels(cs: Candle[], price: number) {
   return { support: fmt(below[0]), resistance: fmt(above[0]), supports: below.slice(0, 3).map(fmt), resistances: above.slice(0, 3).map(fmt), candles: cs.length };
 }
 
-export interface MarketOptions { maxTracked?: number; backfillTxs?: number; backfillPerMin?: number; warmPerMin?: number; now?: () => number }
+export interface MarketOptions { maxTracked?: number; backfillTxs?: number; backfillPerMin?: number; warmPerMin?: number; /** per-mint trade cache dir (repeat backfills are free) */ cacheDir?: string; now?: () => number }
 
 export class PumpMarket {
   series = new Map<string, Series>();
@@ -98,58 +108,144 @@ export class PumpMarket {
       if (r) { r.high = Math.max(r.high, px); r.last = px; }
     }
     if (!e.dust && (this.eng.mintWatched?.(e.mint) || this.eng.watched?.(e.wallet) || this.eng.tagOf?.(e.wallet))) this.warm(e.mint, e.venue !== "curve" ? e.pool : undefined);
-    const s = this.series.get(e.mint); if (!s || !valid) return;
+    const s = this.series.get(e.mint); if (!s) return;
+    const unit = e.quoteMint ? "quote" : "SOL";
+    const lp = unit === "quote" ? e.priceQuote : valid ? e.price : null, lv = unit === "quote" ? e.quoteAmount : solOf(e);
+    if (lp == null || !(lp > 0) || lv == null || e.dust || (unit === "SOL" && !valid)) return;
+    s.unit ??= unit; if (s.unit !== unit) return;
     if (e.venue !== "curve") { s.venue = e.venue; s.pool = e.pool; } else s.venue ??= "curve";
-    if (conv) s.quoteMint = e.quoteMint;
-    this.add(s, e.blockTime ? Math.min(Math.max(now, e.blockTime * 1000), e.blockTime * 1000 + 999) : now, px, solOf(e), true);
+    if (e.quoteMint) s.quoteMint = e.quoteMint;
+    this.addTrade(s, e.blockTime ? Math.min(Math.max(now, e.blockTime * 1000), e.blockTime * 1000 + 999) : now, lp, lv, this.liveKey(s, e.signature), true);
   }
   /** auto-warm: one capped backfill per mint traded by subscribed/tagged wallets or on subscribed mints; at most warmPerMin new mints/min */
   warmed = 0; private warmBudget = { at: 0, n: 0 };
   warm(mint: string, pool?: string) {
-    const s = this.series.get(mint); if (s?.backfill) { s.lastUse = this.now(); return false; }
+    const s = this.series.get(mint); if (s?.job) { s.lastUse = this.now(); return false; }
     const now = this.now(); if (now - this.warmBudget.at > 60_000) this.warmBudget = { at: now, n: 0 };
     if (this.warmBudget.n >= (this.o.warmPerMin ?? 20)) { this.track(mint); return false; }
     this.warmBudget.n++; this.warmed++; void this.backfill(mint, pool).catch(() => {}); return true;
   }
   // ---- backfill: signatures on the bonding curve (or canonical pool) -> getTransaction -> trade events ----
-  private budget(n: number) { const now = this.now(); if (now - this.bfBudget.at > 60_000) this.bfBudget = { at: now, n: 0 }; const cap = this.o.backfillPerMin ?? 600; if (this.bfBudget.n + n > cap) return false; this.bfBudget.n += n; return true; }
-  backfill(mint: string, pool?: string) {
-    const s = this.track(mint); if (s.backfill) return s.backfill;
-    s.backfill = (async () => {
-      const addr = pool ?? s.pool ?? await this.canonicalPool(mint) ?? curvePda(mint); s.pool ??= addr === curvePda(mint) ? undefined : addr; const cap = this.o.backfillTxs ?? 200;
-      const sigs: any[] = (await this.rpc("getSignaturesForAddress", [addr, { limit: Math.min(1000, cap) }]).catch(() => [])) ?? [];
-      let txs = 0, trades = 0, capped = false, from: number | null = null;
-      const ok = sigs.filter((x) => !x.err);
-      for (let i = 0; i < ok.length; i += 4) {
-        if (!this.budget(4)) { capped = true; break; }
-        const got = await Promise.all(ok.slice(i, i + 4).map((x) => this.rpc("getTransaction", [x.signature, { encoding: "json", commitment: "confirmed", maxSupportedTransactionVersion: 0 }]).catch(() => null)));
-        for (let j = 0; j < got.length; j++) {
-          const tx = got[j]; if (!tx?.meta) continue; txs++;
-          const bt = (tx.blockTime ?? ok[i + j].blockTime ?? 0) * 1000; if (!bt) continue;
-          for (const ev of parsePumpLogs(tx.meta.logMessages ?? []).events) {
-            let price: number | null = null, vol = 0;
-            if (ev.k === "pump") {
-              const t = ev.t; if (t.mint !== mint || t.virtualTokenReserves === 0n) continue;
-              s.venue ??= "curve";
-              if (t.virtualSolReserves > 0n) { price = curveMetrics(t.virtualSolReserves, t.virtualTokenReserves, t.realTokenReserves).price; vol = Number(t.solAmount) / 1e9; }
-              else if (t.quote) { // non-SOL-quote curve: quote price converted at the current on-chain route rate
-                const [qd, q] = await Promise.all([this.eng.decimals(t.quote.mint), this.eng.quoteSol(t.quote.mint)]);
-                if (qd == null || q.sol == null) { s.quoteMint = t.quote.mint; continue; }
-                price = (Number(t.quote.virtualReserves) / 10 ** qd) / (Number(t.virtualTokenReserves) / 1e6) * q.sol; vol = Number(t.quote.amount) / 10 ** qd * q.sol; s.quoteMint = t.quote.mint;
-              } else continue;
-            }
-            else { const info = await this.eng.poolInfo(ev.t.pool); const a = ammEvent(ev.t, info, "", 0, 0); if (a.mint !== mint || !a.priceValid) continue; price = a.price; vol = a.solAmount; s.venue ??= a.venue; }
-            if (price == null || !(price > 0) || vol < 0.00001) continue;
-            this.add(s, bt, price, vol, false); trades++; from = from == null ? bt : Math.min(from, bt);
+  // paginated (before/until), rate-limited (backfillPerMin tx/min, waits rather than aborts), cached to disk per mint
+  private async budget(n: number) {
+    for (;;) { const now = this.now(); if (now - this.bfBudget.at > 60_000) this.bfBudget = { at: now, n: 0 }; const cap = this.o.backfillPerMin ?? 600;
+      if (this.bfBudget.n + n <= cap) { this.bfBudget.n += n; return true; }
+      if (this.o.now) return false; // fake clock (tests): no waiting
+      this.rateLimitedWaits++; await new Promise((r) => setTimeout(r, Math.max(500, 60_000 - (now - this.bfBudget.at)))); }
+  }
+  rateLimitedWaits = 0;
+  private file(mint: string) { return this.o.cacheDir ? path.join(this.o.cacheDir, `${mint}.json`) : null; }
+  private load(s: Series) {
+    if (s.h) return s.h;
+    s.h = { trades: [], sigs: new Set(), newest: null, oldest: null, historyEnd: false, txs: 0, txMissing: 0, fromDisk: 0 };
+    const f = this.file(s.mint);
+    if (f && fs.existsSync(f)) try {
+      const j = JSON.parse(fs.readFileSync(f, "utf8"));
+      Object.assign(s.h, { newest: j.newest, oldest: j.oldest, historyEnd: !!j.historyEnd, txMissing: j.txMissing ?? 0 });
+      s.unit ??= j.unit; s.quoteMint ??= j.quoteMint ?? undefined; s.venue ??= j.venue ?? undefined; s.pool ??= j.pool ?? undefined; s.addr = j.addr;
+      for (const [ts, p, v, sig] of j.trades as [number, number, number, string][]) { this.addTrade(s, ts, p, v, sig, false); s.h.sigs.add(sig.split(":")[0]); }
+      s.h.fromDisk = s.h.trades.length;
+    } catch {}
+    return s.h;
+  }
+  private save(s: Series) {
+    const f = this.file(s.mint); if (!f || !s.h) return;
+    try { fs.mkdirSync(path.dirname(f), { recursive: true }); const h = s.h;
+      fs.writeFileSync(f + ".tmp", JSON.stringify({ mint: s.mint, addr: s.addr, unit: s.unit, quoteMint: s.quoteMint ?? null, venue: s.venue ?? null, pool: s.pool ?? null, newest: h.newest, oldest: h.oldest, historyEnd: h.historyEnd, txMissing: h.txMissing,
+        trades: h.trades.filter((t) => t.sig).map((t) => [t.ts, t.p, t.v, t.sig]) }));
+      fs.renameSync(f + ".tmp", f); } catch {}
+  }
+  private liveN = new Map<string, number>();
+  /** same key scheme as backfill (`sig:n` = n-th trade of this mint in the tx) so live + backfilled trades dedupe */
+  private liveKey(s: Series, sig?: string) {
+    if (!sig) return undefined; const k = `${s.mint}:${sig}`; const n = this.liveN.get(k) ?? 0; this.liveN.set(k, n + 1);
+    if (this.liveN.size > 50_000) this.liveN.delete(this.liveN.keys().next().value!);
+    (s.h ?? this.load(s)).sigs.add(sig); return `${sig}:${n}`;
+  }
+  /** raw trade store (unit = s.unit); also feeds the rolling candle arrays (live ones notify subscribers) */
+  private addTrade(s: Series, ts: number, p: number, v: number, sig: string | undefined, live: boolean) {
+    const h = s.h ?? this.load(s);
+    if (sig) { if (h.sigs.has(sig)) return false; h.sigs.add(sig); }
+    let i = h.trades.length - 1; while (i >= 0 && h.trades[i].ts > ts) i--;
+    h.trades.splice(i + 1, 0, { ts, p, v, sig });
+    if (h.trades.length > MAX_TRADES) { const x = h.trades.shift()!; if (x.sig) h.sigs.delete(x.sig); }
+    this.add(s, ts, p, v, live); return true;
+  }
+  /** fetch more history: newer than the cached newest signature, then older than the cached oldest, until maxTx this run or `untilMs` reached */
+  backfill(mint: string, pool?: string, want: { maxTx?: number; fromMs?: number } = {}) {
+    const s = this.track(mint); const h = this.load(s);
+    const maxTx = Math.min(want.maxTx ?? this.o.backfillTxs ?? 200, 5000);
+    const need = (j: Job | undefined) => !j || (!h.historyEnd && ((want.maxTx ?? 0) > j.maxTx || (want.fromMs != null && (j.fromMs == null || want.fromMs < j.fromMs))));
+    if (s.job && !s.job.done && !need(s.job)) return s.job.p;
+    if (s.job?.done && !need(s.job) && !(want.maxTx || want.fromMs)) return s.job.p;
+    const prev = s.job?.p ?? Promise.resolve();
+    const job: Job = { maxTx, fromMs: want.fromMs, done: false, fetched: 0, truncated: null, p: null as any };
+    job.p = prev.catch(() => {}).then(async () => {
+      s.addr ??= pool ?? s.pool ?? await this.canonicalPool(mint) ?? curvePda(mint); if (s.addr !== curvePda(mint)) s.pool ??= s.addr;
+      const fetchSigs = async (opt: any) => ((await this.rpc("getSignaturesForAddress", [s.addr, { limit: 1000, ...opt }]).catch(() => null)) ?? null) as any[] | null;
+      const run = async (sigs: any[]) => {
+        const ok = sigs.filter((x) => !x.err && !h.sigs.has(x.signature));
+        for (let i = 0; i < ok.length; i += 4) {
+          if (job.fetched >= maxTx) { job.truncated = "maxTx"; return false; }
+          if (!(await this.budget(4))) { job.truncated = "rateLimited"; return false; }
+          const part = ok.slice(i, i + 4);
+          const got = await Promise.all(part.map((x) => this.rpc("getTransaction", [x.signature, { encoding: "json", commitment: "confirmed", maxSupportedTransactionVersion: 0 }]).catch(() => null)));
+          for (let j = 0; j < got.length; j++) {
+            job.fetched++; h.txs++; const tx = got[j]; if (!tx?.meta) { h.txMissing++; continue; }
+            await this.ingestTx(s, tx, part[j]);
           }
+          if (want.fromMs != null && (part[part.length - 1].blockTime ?? Infinity) * 1000 < want.fromMs && sigs === older) return false;
         }
+        return true;
+      };
+      let older: any[] = [];
+      // 1) newer than cached newest (pages until we meet it)
+      if (h.newest) {
+        let before: string | undefined; const pages: any[] = [];
+        for (let k = 0; k < 10; k++) { const pg = await fetchSigs({ until: h.newest, ...(before ? { before } : {}) }); if (!pg?.length) break; pages.push(...pg); before = pg[pg.length - 1].signature; if (pg.length < 1000) break; }
+        if (pages.length) { const top = pages[0].signature; await run(pages); if (!job.truncated) h.newest = top; }
       }
-      if (ok.length >= cap) capped = true;
+      // 2) older than cached oldest (or from the tip on first run)
+      while (!job.truncated && !h.historyEnd && job.fetched < maxTx) {
+        if (want.fromMs != null && h.oldestTs != null && h.oldestTs * 1000 < want.fromMs && (want.maxTx == null)) break;
+        const pg = await fetchSigs(h.oldest ? { before: h.oldest } : {}); if (pg == null) { job.truncated = "signaturesError"; break; }
+        if (!pg.length) { h.historyEnd = true; break; }
+        h.newest ??= pg[0].signature; older = pg;
+        const cont = await run(pg);
+        if (!job.truncated) { h.oldest = pg[pg.length - 1].signature; h.oldestTs = pg[pg.length - 1].blockTime ?? h.oldestTs; if (pg.length < 1000) h.historyEnd = true; }
+        else { // resume point = last signature actually fetched
+          const lastDone = [...pg].reverse().find((x) => h.sigs.has(x.signature)); if (lastDone) { h.oldest = lastDone.signature; h.oldestTs = lastDone.blockTime ?? h.oldestTs; } }
+        if (!cont) break;
+        if (want.fromMs != null && (h.oldestTs ?? Infinity) * 1000 < want.fromMs) break;
+      }
+      if (!job.truncated && !h.historyEnd && job.fetched >= maxTx && !(want.fromMs != null && (h.oldestTs ?? Infinity) * 1000 < want.fromMs)) job.truncated = "maxTx";
       if (!s.venue) { const c = await this.eng.curvePrice(mint).catch(() => null); s.venue = c && !c.complete ? "curve" : s.pool ? "amm" : undefined; }
-      s.backfilled = { txs, trades, from, capped };
-      return s.backfilled;
-    })();
-    return s.backfill;
+      this.save(s);
+    }).finally(() => { job.done = true; });
+    s.job = job; return job.p;
+  }
+  private async ingestTx(s: Series, tx: any, sigInfo: any) {
+    const mint = s.mint, sig = sigInfo.signature as string;
+    const bt = (tx.blockTime ?? sigInfo.blockTime ?? 0) * 1000; if (!bt) return;
+    let n = 0;
+    for (const ev of parsePumpLogs(tx.meta.logMessages ?? []).events) {
+      let price: number | null = null, vol = 0, unit: "SOL" | "quote" = "SOL";
+      if (ev.k === "pump") {
+        const t = ev.t; if (t.mint !== mint || t.virtualTokenReserves === 0n) continue;
+        s.venue ??= "curve";
+        if (t.virtualSolReserves > 0n) { price = curveMetrics(t.virtualSolReserves, t.virtualTokenReserves, t.realTokenReserves).price; vol = Number(t.solAmount) / 1e9; }
+        else if (t.quote) {
+          const qd = await this.eng.decimals(t.quote.mint); s.quoteMint = t.quote.mint; if (qd == null) continue; unit = "quote";
+          price = (Number(t.quote.virtualReserves) / 10 ** qd) / (Number(t.virtualTokenReserves) / 1e6); vol = Number(t.quote.amount) / 10 ** qd;
+        } else continue;
+      } else {
+        const info = await this.eng.poolInfo(ev.t.pool); const a = ammEvent(ev.t, info, "", 0, 0); if (a.mint !== mint || !a.priceValid) continue; price = a.price; vol = a.solAmount; s.venue ??= a.venue;
+      }
+      if (price == null || !(price > 0) || (unit === "SOL" && vol < 0.00001)) continue;
+      s.unit ??= unit; if (s.unit !== unit) continue;
+      this.addTrade(s, bt, price, vol, `${sig}:${n++}`, false);
+    }
+    s.h!.sigs.add(sig);
   }
   /** migrated mint -> PumpSwap mint/WSOL pool (one getProgramAccounts), else null (still on the curve) */
   private async canonicalPool(mint: string): Promise<string | null> {
@@ -159,17 +255,38 @@ export class PumpMarket {
       filters: [{ memcmp: { offset: 43, bytes: mint } }, { memcmp: { offset: 75, bytes: "So11111111111111111111111111111111111111112" } }] }]).catch(() => []) ?? [];
     return accs[0]?.pubkey ?? null;
   }
-  /** params: [mint, {interval: "1s"|"5s"|"1m" (default "1m"), lookback: candles (default 60), backfill?: bool (default true), pool?}] */
+  /** params: [mint, {interval: "1s"|"5s"|"1m" (default "1m"), lookback?: candles (default 60), from?/to?: unix sec, backfill?: true, maxTx?: <=5000, waitMs?: <=120000, pool?}] */
   async candles(mint: any, cfg: any = {}) {
-    if (!isPubkey(mint)) throw INVALID_PARAMS("pumpCandles: params [mint, {interval, lookback}]");
+    if (!isPubkey(mint)) throw INVALID_PARAMS("pumpCandles: params [mint, {interval, lookback | from, to}]");
     cfg ??= {}; const iv: Interval = cfg.interval ?? "1m";
     if (!(iv in INTERVALS)) throw INVALID_PARAMS("pumpCandles: interval one of 1s, 5s, 1m");
-    const lb = cfg.lookback ?? 60; if (!(Number.isInteger(lb) && lb >= 1 && lb <= KEEP[iv])) throw INVALID_PARAMS(`pumpCandles: lookback integer 1..${KEEP[iv]} for ${iv}`);
-    const s = this.track(mint);
-    if (cfg.backfill !== false) { let to: any; await Promise.race([this.backfill(mint, cfg.pool), new Promise((r) => { to = setTimeout(r, 20_000); })]); clearTimeout(to); }
-    const arr = s.c[iv], since = Math.floor(this.now() / 1000 / INTERVALS[iv]) * INTERVALS[iv] * 1000 - (lb - 1) * INTERVALS[iv] * 1000;
-    return { mint, interval: iv, venue: s.venue ?? null, quoteMint: s.quoteMint ?? null, candles: arr.filter((k) => k.t >= since), backfill: s.backfilled ?? null,
-      note: "OHLC in SOL from valid, non-dust prices (curve or canonical AMM; non-SOL quotes via priceSol at the current route rate); v = SOL volume; empty buckets omitted; backfill = getSignaturesForAddress(curve/pool) + getTransaction, capped" };
+    const sec = INTERVALS[iv];
+    for (const k of ["from", "to"]) if (cfg[k] != null && !(Number.isFinite(cfg[k]) && cfg[k] > 1e9 && cfg[k] < 1e11)) throw INVALID_PARAMS(`pumpCandles: ${k} must be unix seconds`);
+    if (cfg.maxTx != null && !(Number.isInteger(cfg.maxTx) && cfg.maxTx >= 0 && cfg.maxTx <= 5000)) throw INVALID_PARAMS("pumpCandles: maxTx integer 0..5000");
+    const nowS = Math.floor(this.now() / 1000), to = cfg.to ?? nowS;
+    const lb = cfg.lookback ?? 60;
+    const from = cfg.from ?? (Math.floor(to / sec) - lb + 1) * sec;
+    if (!(from <= to)) throw INVALID_PARAMS("pumpCandles: from must be <= to");
+    if ((to - from) / sec > 5000) throw INVALID_PARAMS("pumpCandles: range too large (max 5000 candles; use a bigger interval)");
+    if (cfg.from == null && !(Number.isInteger(lb) && lb >= 1 && lb <= 5000)) throw INVALID_PARAMS("pumpCandles: lookback integer 1..5000");
+    const s = this.track(mint); const h = this.load(s);
+    if (cfg.backfill !== false) {
+      const p = this.backfill(mint, cfg.pool, { maxTx: cfg.maxTx, fromMs: cfg.from != null ? from * 1000 : undefined });
+      let t: any; await Promise.race([p, new Promise((r) => { t = setTimeout(r, Math.min(Number(cfg.waitMs ?? 20_000), 120_000)); })]); clearTimeout(t);
+    }
+    const cs = buildCandles(h.trades, sec, from * 1000, to * 1000 + 999);
+    const unit = s.unit ?? "SOL";
+    let rate: { sol: number | null; via: string | null; reason?: string } = { sol: 1, via: "SOL" };
+    if (unit === "quote" && s.quoteMint) rate = await this.eng.quoteSol(s.quoteMint).catch(() => ({ sol: null, via: null, reason: "lookupFailed" }));
+    const covFrom = h.trades.length ? Math.floor(h.trades[0].ts / 1000) : null, covTo = h.trades.length ? Math.floor(h.trades[h.trades.length - 1].ts / 1000) : null;
+    const j = s.job;
+    return { mint, interval: iv, from, to, venue: s.venue ?? null, priceUnit: unit === "quote" ? "quote" : "SOL", quoteMint: s.quoteMint ?? null,
+      quoteSolRate: unit === "quote" ? rate.sol : 1, solConversion: unit === "quote" ? (rate.sol != null ? `current rate via ${rate.via} (not historical)` : `unavailable: ${rate.reason ?? "noSolRoute"}`) : "native",
+      candles: cs.map((k) => unit === "quote" && rate.sol != null ? { ...k, oSol: k.o * rate.sol!, hSol: k.h * rate.sol!, lSol: k.l * rate.sol!, cSol: k.c * rate.sol!, vSol: k.v * rate.sol! } : k),
+      coverage: { from: covFrom, to: covTo, trades: h.trades.length, fromDiskCache: h.fromDisk, txsFetched: h.txs, txMissing: h.txMissing, historyEnd: h.historyEnd,
+        requestCovered: h.historyEnd || (covFrom != null && covFrom <= from), inProgress: j ? !j.done : false, truncated: j?.truncated ?? null, rateLimitedWaits: this.rateLimitedWaits,
+        note: h.txMissing ? "some getTransaction calls returned null (upstream may lack archive depth)" : !h.historyEnd ? "older history exists beyond coverage.from; raise maxTx or pass from" : "full signature history fetched" },
+      note: `OHLC in ${unit === "quote" ? "quote-token units (priceQuote); *Sol fields = converted at the current on-chain rate" : "SOL"} from valid, non-dust trades; v = volume in priceUnit; empty buckets omitted` };
   }
   subscribeCandles(mint: string, iv: Interval, cb: (c: any) => void) {
     if (!isPubkey(mint)) throw INVALID_PARAMS("pumpCandlesSubscribe: params [mint, {interval}]");
@@ -185,7 +302,7 @@ export class PumpMarket {
       const cs = s.c["1m"].length >= 10 ? s.c["1m"] : s.c["5s"];
       s.lv = { at: now, v: { interval: cs === s.c["1m"] ? "1m" : "5s", cs: cs.slice(-240) } };
     }
-    const l = computeLevels(s.lv.v.cs, price); return l ? { interval: s.lv.v.interval, ...l } : null;
+    const l = computeLevels(s.lv.v.cs, price); return l ? { interval: s.lv.v.interval, priceUnit: s.unit === "quote" ? "quote" : "SOL", ...l } : null;
   }
   // ---- market regime ----
   regime() {

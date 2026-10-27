@@ -40,18 +40,36 @@ test("candles: live valid prices only, dust/invalid skipped, subscribe notificat
   m.close();
 });
 
-test("candles backfill: signatures -> getTransaction -> trade events, capped", async () => {
+test("candles backfill: paginated, rate-limited, quote units + SOL conversion, from/to, disk cache", async () => {
   const fx = JSON.parse(fs.readFileSync("test/fixtures/pump-logs.json", "utf8"));
   const logs = ["Program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P invoke [1]", fx.pumpLog, "Program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P success"];
-  const ev = parsePumpLogs(logs).events.find((e: any) => e.k === "pump") as any; assert.ok(ev, "fixture parses");
-  const mint = ev.t.mint; const calls: Record<string, number> = {};
+  const ev = parsePumpLogs(logs).events.find((e: any) => e.k === "pump") as any; const mint = ev.t.mint;
+  const TOTAL = 2500, T0 = 1_700_000_000; // sig i has blockTime T0 + TOTAL - i (newest first)
+  const calls: Record<string, number> = {}; const sigOpts: any[] = [];
   const rpc = async (meth: string, p: any[]) => { calls[meth] = (calls[meth] ?? 0) + 1;
-    if (meth === "getSignaturesForAddress") return Array.from({ length: p[1].limit }, (_, i) => ({ signature: `sig${i}`, blockTime: 1_700_000_000 + i, err: null }));
-    return { blockTime: 1_700_000_000, meta: { logMessages: logs } }; };
-  const m = new PumpMarket(stub(), rpc, { now: () => 1_700_000_100_000, backfillTxs: 12, backfillPerMin: 8 });
-  const r = await m.candles(mint, { interval: "1m", lookback: 5 });
-  assert.equal(calls.getTransaction, 8); assert.equal(r.backfill!.capped, true); assert.ok(r.candles.length >= 1);
-  assert.equal(r.candles[0].n, 8); assert.equal(r.quoteMint, "Xs2yquAgsHByNzx68WJC55WHjHBvG9JsMB7CWjTLyPy"); assert.ok(r.candles[0].c > 0);
+    if (meth === "getSignaturesForAddress") { sigOpts.push(p[1]); const start = p[1].before ? Number(p[1].before.slice(3)) + 1 : 0;
+      return Array.from({ length: Math.max(0, Math.min(p[1].limit, TOTAL - start)) }, (_, i) => ({ signature: `sig${start + i}`, blockTime: T0 + TOTAL - (start + i), err: null })); }
+    if (meth === "getTransaction") { const i = Number(p[0].slice(3)); return { blockTime: T0 + TOTAL - i, meta: { logMessages: logs } }; }
+    return null; };
+  const dir = fs.mkdtempSync("/tmp/pc-"); const now = () => (T0 + TOTAL + 10) * 1000;
+  const m = new PumpMarket(stub(), rpc, { now, backfillPerMin: 100_000, cacheDir: dir });
+  const r = await m.candles(mint, { interval: "1m", from: T0, to: T0 + TOTAL, maxTx: 2000 });
+  assert.equal(calls.getTransaction, 2000); assert.equal(r.coverage.truncated, "maxTx"); assert.equal(r.coverage.historyEnd, false); assert.equal(r.coverage.requestCovered, false);
+  assert.equal(sigOpts[1].before, "sig999"); // paginated
+  assert.equal(r.priceUnit, "quote"); assert.equal(r.quoteMint, "Xs2yquAgsHByNzx68WJC55WHjHBvG9JsMB7CWjTLyPy"); assert.equal(r.quoteSolRate, 0.01);
+  assert.ok(Math.abs((r.candles[0] as any).cSol - r.candles[0].c * 0.01) < 1e-18);
+  const sub = await m.candles(mint, { interval: "1m", from: T0 + 2000, to: T0 + 2119, backfill: false });
+  assert.ok(sub.candles.every((k: any) => k.t >= Math.floor((T0 + 2000) / 60) * 60000 && k.t <= (T0 + 2179) * 1000)); assert.equal(sub.candles.reduce((a: number, k: any) => a + k.n, 0), 120);
+  // second process: disk cache -> repeat free; deeper request continues from oldest
+  calls.getTransaction = 0;
+  const m2 = new PumpMarket(stub(), rpc, { now, backfillPerMin: 100_000, cacheDir: dir });
+  const r2 = await m2.candles(mint, { interval: "1m", from: T0, to: T0 + TOTAL, maxTx: 2000 });
+  assert.equal(r2.coverage.fromDiskCache, 2000); assert.equal(calls.getTransaction, 500); assert.equal(r2.coverage.historyEnd, true); assert.equal(r2.coverage.requestCovered, true);
+  assert.equal(r2.coverage.trades, 2500);
+  // rate limit (fake clock -> no waiting): truncated honestly
+  const m3 = new PumpMarket(stub(), rpc, { now, backfillPerMin: 8 });
+  const r3 = await m3.candles(mint, { interval: "1m", lookback: 5 }); assert.equal(r3.coverage.truncated, "rateLimited"); assert.equal(r3.coverage.txsFetched, 8);
+  await assert.rejects(m.candles(mint, { from: 5 }), /unix seconds/);
 });
 
 test("marketRegime: SOL change insufficient then computed, net flow windows, drawdown share", () => {

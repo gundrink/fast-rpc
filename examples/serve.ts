@@ -11,7 +11,7 @@ if (host !== "127.0.0.1" && host !== "localhost" && open && process.env.ALLOW_PU
 const wf = process.env.PUMP_WALLETS_FILE ?? "/workspace/sapi/wallets.txt";
 const wallets = fs.existsSync(wf) ? parseWalletsFile(fs.readFileSync(wf, "utf8")) : new Map<string, string>();
 const pumpAnalytics = process.env.PUMP_ANALYTICS === "0" ? false as const : { dataFile: process.env.PUMP_DATA_FILE ?? "data/pump-analytics.json", wallets, backfill: process.env.PUMP_BACKFILL !== "0" };
-const { server, close } = createFastRpc({ hub: { log: console.log }, server: { log: console.log }, pumpAnalytics, pumpMarket: process.env.PUMP_MARKET === "0" ? false : {} });
+const { server, close } = createFastRpc({ hub: { log: console.log }, server: { log: console.log }, pumpAnalytics, pumpMarket: process.env.PUMP_MARKET === "0" ? false : { cacheDir: process.env.PUMP_CANDLE_DIR ?? "data/pump-candles", backfillPerMin: Number(process.env.PUMP_BACKFILL_PER_MIN ?? 600) } });
 const port = await server.listen(Number(process.env.PORT ?? 7070), host);
 console.log(`fast-rpc on ${host}:${port} (binary + HTTP JSON-RPC + Solana WS + SSE /stream) -> ${process.env.SOLANA_RPC_URLS ?? upstreamUrl} | ${wsUrl} | auth ${open ? "OFF" : "ON"}`);
 for (const s of ["SIGTERM", "SIGINT"] as const) process.on(s, () => void close().finally(() => process.exit(0)));

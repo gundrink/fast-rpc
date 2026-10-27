@@ -43,7 +43,8 @@ export interface PumpSwapEvent {
   signature: string; slot: number; blockTime: number | null; wallet: string; mint: string | null; side: "buy" | "sell";
   solAmount: number; tokenAmount: number; solAmountRaw: string; tokenAmountRaw: string;
   virtualSolReserves: string; virtualTokenReserves: string; price: number | null; create: boolean;
-  program: "pump" | "pumpswap"; pool?: string; realTokenReserves?: string; progress?: number; marketCapSol?: number | null;
+  program: "pump" | "pumpswap"; pool?: string; realTokenReserves?: string; realSolReserves?: string; quoteReservesRaw?: string;
+  /** curve: real SOL (or quote) reserves; pool: SOL-side (or quote) reserve x2; null when not convertible */ liquiditySol?: number | null; liquidityUsd?: number | null; liquidityBasis?: string; liquidityReason?: string; progress?: number; marketCapSol?: number | null;
   commitment: "processed" | "confirmed"; source: "logs" | "balanceDiff"; tag?: string; pctOfPositionSold?: number | null;
   update?: "confirmed" | "position"; receivedAt: number; quoteNonSol?: boolean;
   /** price validity: only valid prices feed high/drawdown/alerts */
@@ -168,7 +169,7 @@ export function pnlView(x: Pnl, price: number | null) {
   return { boughtSol: x.boughtSol, soldSol: x.soldSol, buys: x.buys, sells: x.sells, avgEntryPrice: avg, holdingTokens: hold, realizedSol: realized, unrealizedSol: unreal,
     pnlPct: avg != null && x.boughtSol > 0 ? ((realized + (unreal ?? 0)) / x.boughtSol) * 100 : null };
 }
-export interface DrawdownEvent { type: "drawdown" | "rebound"; mint: string; pct: number; threshold?: number; high: number; low?: number; price: number; basis: "subscribe" | "firstTag"; signature: string; slot: number; wallet: string; tag?: string; receivedAt: number }
+export interface DrawdownEvent { type: "drawdown" | "rebound"; mint: string; pct: number; threshold?: number; high: number; low?: number; price: number; basis: "subscribe" | "firstTag"; signature: string; slot: number; blockTime: number | null; wallet: string; tag?: string; receivedAt: number }
 
 /** Update one basis with a new price; returns alerts to emit. */
 export function stepBasis(b: Basis, price: number, alerts: number[] = [], rebound?: number): { kind: "drawdown" | "rebound"; pct: number; threshold?: number; low?: number }[] {
@@ -186,6 +187,21 @@ const ddPct = (b: Basis | undefined, price: number) => (b && b.high > 0 ? Math.m
 
 export interface PoolInfo { base: string; quote: string; baseDec: number | null; quoteDec: number | null; canonical: boolean; creator?: string }
 
+/** liquidity + market cap, same basis for curve and AMM (SOL side, or non-SOL quote converted at quoteSolRate) */
+export function liquidity(e: PumpSwapEvent, solUsd: number | null) {
+  if ((e as any).type === "update" || !e.mint) return;
+  const curve = e.program === "pump";
+  if (e.quoteMint) {
+    const q = e.quoteReservesRaw != null && e.quoteDecimals != null ? Number(e.quoteReservesRaw) / 10 ** e.quoteDecimals * (curve ? 1 : 2) : null;
+    e.liquiditySol = q != null && e.quoteSolRate != null ? q * e.quoteSolRate : null; e.liquidityBasis = curve ? "curveRealQuote" : "poolQuoteX2";
+    if (e.liquiditySol == null) e.liquidityReason = q == null ? "noQuoteReserves" : e.solEquivalentReason ?? "noSolRoute";
+    if (e.marketCapSol == null) e.marketCapSol = e.priceSol != null ? e.priceSol * Number(TOTAL_SUPPLY) / TOKEN_DEC : null;
+  } else if (curve && e.realSolReserves) { e.liquiditySol = Number(e.realSolReserves) / SOL; e.liquidityBasis = "curveRealSol"; }
+  else if (!curve && e.virtualSolReserves && e.virtualSolReserves !== "0") { e.liquiditySol = Number(e.virtualSolReserves) * 2 / SOL; e.liquidityBasis = "poolSolX2"; }
+  else { e.liquiditySol = null; e.liquidityReason = e.source === "balanceDiff" ? "fillOnly" : "noReserves"; }
+  e.liquidityUsd = e.liquiditySol != null && solUsd ? e.liquiditySol * solUsd : null;
+  if (e.marketCapSol != null && solUsd && e.marketCapUsd == null && (e.priceValid || e.quoteMint)) e.marketCapUsd = e.marketCapSol * solUsd;
+}
 /** for a pool without WSOL: true when pool.base is the quote-like asset, so the traded token is pool.quote */
 export function nonSolFlip(pool: { base: string; quote: string }) {
   const q = (m: string) => m in STABLES || m === PUMP_TOKEN;
@@ -275,7 +291,8 @@ export class PumpEngine {
         const bad = !nonSol && (t.virtualTokenReserves === 0n || t.virtualTokenReserves < t.realTokenReserves);
         const se: PumpSwapEvent = ({ signature: sig, slot: e.slot, blockTime: Number(t.timestamp), wallet: t.user, mint: t.mint, side: t.isBuy ? "buy" : "sell",
           solAmount: Number(t.solAmount) / SOL, tokenAmount: Number(t.tokenAmount) / TOKEN_DEC, solAmountRaw: String(t.solAmount), tokenAmountRaw: String(t.tokenAmount),
-          virtualSolReserves: String(t.virtualSolReserves), virtualTokenReserves: String(t.virtualTokenReserves), realTokenReserves: String(t.realTokenReserves),
+          virtualSolReserves: String(t.virtualSolReserves), virtualTokenReserves: String(t.virtualTokenReserves), realTokenReserves: String(t.realTokenReserves), realSolReserves: String(t.realSolReserves),
+          ...(nonSol && t.quote ? { quoteReservesRaw: String(t.quote.realReserves) } : {}),
           price: m.price, marketCapSol: m.marketCapSol, progress: m.progress, create: r.create, program: "pump", ...(nonSol ? { quoteNonSol: true } : {}), commitment: "processed", source: "logs", receivedAt: at,
           venue: "curve", priceSource: "curveEventReserves", priceValid: !nonSol && !bad && m.price != null, ...(nonSol ? { priceInvalidReason: "nonSolQuote" as const } : bad ? { priceInvalidReason: "badReserves" as const } : {}), tokenDecimals: 6,
           ...(r.completeMints.includes(t.mint) ? { complete: true } : {}) });
@@ -289,7 +306,7 @@ export class PumpEngine {
             const f = nonSolFlip(pool);
             const [qm, qd, qa, qr, td, tr] = f ? [pool.base, pool.baseDec, t.baseAmount, t.baseAfter, pool.quoteDec, t.quoteAfter] : [pool.quote, pool.quoteDec, t.quoteAmount, t.quoteAfter, pool.baseDec, t.baseAfter];
             const pq = qd != null && td != null && tr > 0n ? (Number(qr) / 10 ** qd) / (Number(tr) / 10 ** td) : null;
-            ev.quoteFeeRaw = String(t.fee);
+            ev.quoteFeeRaw = String(t.fee); ev.quoteReservesRaw = String(qr);
             void this.withQuote(ev, qm, qa, qd, pq, "event").then(() => this.emit(ev), () => this.emit(ev));
           } else this.emit(ev);
         };
@@ -356,6 +373,7 @@ export class PumpEngine {
     this.guard(e);
     if (solOf(e) < 0.000_01 && (e.priceValid || e.solEquivalent != null)) e.dust = true;
     if (this.solUsd) { e.solUsd = this.solUsd; e.priceUsd = e.priceValid && e.price != null ? e.price * this.solUsd : null; e.marketCapUsd = e.priceValid && e.marketCapSol != null ? e.marketCapSol * this.solUsd : null; }
+    liquidity(e, this.solUsd);
     for (const h of this.hooks) try { h(e); } catch {}
     const ls = [...this.ls].filter((l) => this.match(l, e)); if (!ls.length) { this.track(e); return; }
     const key = `${e.wallet}:${e.mint}`; const raw = BigInt(e.tokenAmountRaw);
@@ -377,7 +395,7 @@ export class PumpEngine {
         for (const [basis, b] of [["subscribe", t.sub], ["firstTag", t.tag]] as const) {
           if (!b) continue;
           for (const a of stepBasis(b, e.price!, l.p.drawdownAlerts, l.p.reboundPct))
-            alerts.push({ type: a.kind, mint: e.mint, venue: e.venue, pct: Math.round(a.pct * 100) / 100, ...(a.threshold != null ? { threshold: a.threshold } : {}), high: b.high, ...(a.low != null ? { low: a.low } : {}), price: e.price, ...(e.solUsd ? { priceUsd: e.price! * e.solUsd } : {}), basis, signature: e.signature, slot: e.slot, wallet: e.wallet, ...(tag ? { tag } : {}), receivedAt: e.receivedAt });
+            alerts.push({ type: a.kind, mint: e.mint, venue: e.venue, pct: Math.round(a.pct * 100) / 100, ...(a.threshold != null ? { threshold: a.threshold } : {}), high: b.high, ...(a.low != null ? { low: a.low } : {}), price: e.price, ...(e.solUsd ? { priceUsd: e.price! * e.solUsd } : {}), basis, signature: e.signature, slot: e.slot, blockTime: e.blockTime ?? null, wallet: e.wallet, ...(tag ? { tag } : {}), receivedAt: e.receivedAt });
         }
       }
       if (tracked) {
@@ -394,7 +412,7 @@ export class PumpEngine {
           extra.mintStats = { buys: g.buys, sells: g.sells, buySol: g.buySol, sellSol: g.sellSol, netSol: g.buySol - g.sellSol, uniqueBuyers: g.buyers.size, uniqueSellers: g.sellers.size,
             buySellRatio: g.sellSol > 0 ? g.buySol / g.sellSol : null, sinceMs: e.receivedAt - g.first, taggedBuyersInWindow: g.tagBuys.size, taggedBuyersByTag: tags };
           if (tag && e.side === "buy") for (const th of l.p.confluenceAlerts ?? []) if (g.tagBuys.size >= th && !g.conflFired.has(th)) {
-            g.conflFired.add(th); alerts.push({ type: "confluence", mint: e.mint, threshold: th, count: g.tagBuys.size, wallets: [...g.tagBuys.keys()], tags, price: px, signature: e.signature, slot: e.slot, receivedAt: e.receivedAt });
+            g.conflFired.add(th); alerts.push({ type: "confluence", mint: e.mint, threshold: th, count: g.tagBuys.size, wallets: [...g.tagBuys.keys()], tags, price: px, signature: e.signature, slot: e.slot, blockTime: e.blockTime ?? null, receivedAt: e.receivedAt });
           }
           if (g.tagBuys.size < Math.min(...(l.p.confluenceAlerts ?? [Infinity]))) g.conflFired.clear(); // re-arm when the window empties
           if (tag || l.w?.has(e.wallet)) {

@@ -2,7 +2,7 @@ import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import WebSocket from "ws";
-import { stepBasis, createFastRpc, decodePumpTrade, decodeAmmEvent, parsePumpLogs, decodeBondingCurve, curveMetrics, curvePda, PUMP_DISC, b58decode, WSOL, ammEvent, decodePythPrice } from "../src/index.js";
+import { stepBasis, createFastRpc, decodePumpTrade, decodeAmmEvent, parsePumpLogs, decodeBondingCurve, curveMetrics, curvePda, PUMP_DISC, b58decode, WSOL, ammEvent, decodePythPrice, PumpEngine, solOf } from "../src/index.js";
 import { startMockSolana, waitFor } from "./helpers.js";
 
 const fx = JSON.parse(fs.readFileSync(new URL("./fixtures/pump-logs.json", import.meta.url), "utf8"));
@@ -153,4 +153,35 @@ test("outlier guard (rolling median, regime change) + dust flag", async () => {
   assert.deepEqual(sw.map((e) => e.priceValid), [true, true, true, false, true, false, false, true, true]);
   assert.equal(sw[3].priceInvalidReason, "outlier"); assert.equal(sw[4].dust, true); assert.equal(sw[0].venue, "curve"); assert.equal(sw[0].priceSource, "curveEventReserves");
   ws.close(); await app.close();
+});
+
+test("v2 non-SOL quote: decode quote tail from real buy_v2 event, SOL equivalent via PumpSwap pool / Pyth stable / no route", async () => {
+  const r = parsePumpLogs(fx.v2QuoteLogs); assert.equal(r.events.length, 1);
+  const t = r.events[0].t as any; assert.equal(t.virtualSolReserves, 0n);
+  assert.deepEqual(t.quote, { mint: "Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh", amount: 10397860n, virtualReserves: 1954395397n, realReserves: 438227643n, fee: 98780n + 46791n });
+  const X = t.quote.mint, POOL = "VJf32Y1CFnaeHhaPnEEspP7T9AyYTYadx1WBbxkx4KQ", BV = "BmsS1UQe1fNabmRquqBEJPJyUzS3oAxRoiVZ7zFbgx4v", QV = "Ee6W2aKifnDSpC5JP4aU1vUrcqKLGTqV3WARC9okSGSc";
+  const mintAcc = (dec: number) => { const b = Buffer.alloc(82); b[44] = dec; return { value: { data: [b.toString("base64"), "base64"] } }; };
+  const poolAcc = () => { const d = Buffer.alloc(203); b58decode(X).copy(d, 43); b58decode(WSOL).copy(d, 75); b58decode(BV).copy(d, 139); b58decode(QV).copy(d, 171); return d; };
+  const u64 = (n: bigint) => { const b = Buffer.alloc(8); b.writeBigUInt64LE(n); return { data: [b.toString("base64"), "base64"] }; };
+  const calls: string[] = [];
+  const rpc = async (m: string, p: any[]) => { calls.push(m);
+    if (m === "getAccountInfo") return p[0] === X ? mintAcc(8) : mintAcc(6);
+    if (m === "getProgramAccounts") return p[1].filters[0].memcmp.offset === 43 && p[1].filters[0].memcmp.bytes === X ? [{ pubkey: POOL }] : [];
+    if (m === "getMultipleAccounts") return p[0][0] === POOL ? { value: [{ data: [poolAcc().toString("base64"), "base64"] }] } : { value: [u64(200_000_000n), u64(100_000_000_000n)] }; // 2 X : 100 SOL -> 50 SOL per X
+    throw new Error(m); };
+  const eng = new PumpEngine({} as any, rpc as any, { solUsd: false });
+  const e: any = { solAmount: 0, tokenAmount: 1 };
+  await (eng as any).curveQuote(e, t);
+  assert.equal(e.quoteMint, X); assert.equal(e.quoteDecimals, 8); assert.equal(e.quoteAmount, 0.1039786); assert.equal(e.quoteSource, "event");
+  assert.ok(Math.abs(e.priceQuote - (19.54395397 / 832404917.539357)) < 1e-18);
+  assert.equal(e.quoteSolRate, 50); assert.ok(Math.abs(e.solEquivalent - 5.19893) < 1e-9); assert.equal(e.solEquivalentSource, `pumpswap:${POOL}`);
+  assert.ok(Math.abs(e.priceSol - e.priceQuote * 50) < 1e-15); assert.equal(solOf(e), e.solEquivalent);
+  // stable via Pyth
+  eng.solUsd = 100; const s: any = { solAmount: 0 };
+  await eng.withQuote(s, "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", 2_500_000n, 6, 0.001, "event");
+  assert.equal(s.solEquivalent, 0.025); assert.equal(s.solEquivalentSource, "pyth:USDC"); assert.equal(s.priceSol, 0.00001);
+  // unknown quote: no pool, no curve -> null + reason
+  const n: any = { solAmount: 0 };
+  await eng.withQuote(n, "11111111111111111111111111111112", 5n, 6, null, "event");
+  assert.equal(n.solEquivalent, null); assert.equal(n.solEquivalentReason, "noSolRoute"); assert.equal(solOf(n), 0);
 });

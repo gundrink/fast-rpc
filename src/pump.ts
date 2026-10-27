@@ -12,6 +12,11 @@ export const WSOL = "So11111111111111111111111111111111111111112";
 export const PYTH_SOL_USD = "7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE";
 /** PriceUpdateV2: disc8, write_authority32, verification_level(1 byte Full | 2 bytes Partial), feed_id32, price i64, conf u64, expo i32, publish_time i64 */
 export interface LaunchRisk { creator: string | null; createSlot: number; creatorPct: number; bundleWallets: number; bundlePct: number; sameSlotBuys: number; earlyBuyers: number; sharedFunder?: { funder: string; wallets: number } | null; creatorFundedWallets?: number; score: number; final: boolean }
+/** stablecoins priced via Pyth SOL/USD */
+export const PUMP_TOKEN = "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn";
+export const STABLES: Record<string, string> = { EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v: "USDC", Es9vMFrzaCERmJfrF4H2FYD4KCoNkY2NoAjW1dEYN6EM: "USDT", USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB: "USD1" };
+/** SOL value of a swap: solAmount, or solEquivalent for non-SOL quotes */
+export const solOf = (e: { solAmount: number; solEquivalent?: number | null }) => e.solEquivalent ?? e.solAmount;
 export function decodePythPrice(b: Buffer) {
   if (b.length < 100) return null;
   const o = 40 + (b[40] === 0 ? 2 : 1) + 32;
@@ -46,7 +51,11 @@ export interface PumpSwapEvent {
   /** "curve" = pump bonding curve, "amm" = canonical PumpSwap pool (migrated), "amm-other" = any other PumpSwap pool */
   venue: "curve" | "amm" | "amm-other"; priceSource: "curveEventReserves" | "poolEventReserves" | "balanceDiff";
   /** price excluded from high/drawdown (dust swap below minSolForHigh) */
-  dust?: boolean; tokenDecimals?: number; solUsd?: number | null; priceUsd?: number | null; marketCapUsd?: number | null; complete?: boolean;
+  dust?: boolean; tokenDecimals?: number;
+  /** non-SOL quote (buy_v2/sell_v2 curves, non-WSOL PumpSwap pools): amounts in the quote token + SOL conversion (null + reason if no on-chain route) */
+  quoteMint?: string; quoteAmountRaw?: string; quoteAmount?: number | null; quoteDecimals?: number | null; priceQuote?: number | null;
+  quoteSolRate?: number | null; solEquivalent?: number | null; priceSol?: number | null; solEquivalentSource?: string | null; solEquivalentReason?: string;
+  quoteSource?: "event" | "balanceDiff"; /** fees in quote raw units (curve: fee + creator fee; pool: lp + protocol fee); quoteAmount is net of fees */ quoteFeeRaw?: string; solUsd?: number | null; priceUsd?: number | null; marketCapUsd?: number | null; complete?: boolean;
 }
 
 /** pump.fun TradeEvent (bonding curve). */
@@ -54,7 +63,17 @@ export function decodePumpTrade(b: Buffer) {
   const r = new R(b);
   const t = { mint: r.pk(), solAmount: r.u64(), tokenAmount: r.u64(), isBuy: r.bool(), user: r.pk(), timestamp: r.i64(),
     virtualSolReserves: r.u64(), virtualTokenReserves: r.u64(), realSolReserves: r.u64(), realTokenReserves: r.u64() };
-  return t;
+  // v2 tail (after fee/creator fields and the ix_name string at 258): quote_mint, quote_amount, virtual_quote_reserves, real_quote_reserves
+  let quote: { mint: string; amount: bigint; virtualReserves: bigint; realReserves: bigint; fee: bigint } | undefined;
+  if (b.length >= 262) {
+    const n = b.readUInt32LE(258), E = 262 + n;
+    if (n > 0 && n < 64 && b.length >= E + 93 && /^[a-z_]+$/.test(b.subarray(262, E).toString("latin1"))) {
+      const qm = b58encode(b.subarray(E + 37, E + 69));
+      // fee (169) + creator_fee (217) are in quote units on v2/v3 curves
+      if (qm !== "11111111111111111111111111111111") quote = { mint: qm, amount: b.readBigUInt64LE(E + 69), virtualReserves: b.readBigUInt64LE(E + 77), realReserves: b.readBigUInt64LE(E + 85), fee: b.readBigUInt64LE(169) + b.readBigUInt64LE(217) };
+    }
+  }
+  return { ...t, quote };
 }
 /** PumpSwap BuyEvent/SellEvent: shared prefix layout up to pool + user. Reserves are pool reserves *before* the swap. */
 export function decodeAmmEvent(b: Buffer, buy: boolean) {
@@ -65,7 +84,7 @@ export function decodeAmmEvent(b: Buffer, buy: boolean) {
   // reserves after: buy -> base out, quote in (quoteAmount incl. lp fee stays in pool); sell -> base in, quote out (+ protocol fee leaves)
   const baseAfter = buy ? poolBase - baseAmount : poolBase + baseAmount;
   const quoteAfter = buy ? poolQuote + quoteAmount + lpFee : poolQuote - quoteAmount + lpFee; void protocolFee;
-  return { timestamp, buy, baseAmount, quoteAmount, userQuote, pool, user, poolBase, poolQuote, baseAfter, quoteAfter };
+  return { timestamp, buy, baseAmount, quoteAmount, userQuote, pool, user, poolBase, poolQuote, baseAfter, quoteAfter, fee: lpFee + protocolFee };
 }
 /** BondingCurve account. */
 export function decodeBondingCurve(data: Buffer) {
@@ -243,16 +262,24 @@ export class PumpEngine {
         // buy_v2/sell_v2 on non-SOL-quote curves log zero SOL fields: no SOL price from the event
         const nonSol = t.virtualSolReserves === 0n; if (nonSol) { m.price = null; m.marketCapSol = null; }
         const bad = !nonSol && (t.virtualTokenReserves === 0n || t.virtualTokenReserves < t.realTokenReserves);
-        this.emit({ signature: sig, slot: e.slot, blockTime: Number(t.timestamp), wallet: t.user, mint: t.mint, side: t.isBuy ? "buy" : "sell",
+        const se: PumpSwapEvent = ({ signature: sig, slot: e.slot, blockTime: Number(t.timestamp), wallet: t.user, mint: t.mint, side: t.isBuy ? "buy" : "sell",
           solAmount: Number(t.solAmount) / SOL, tokenAmount: Number(t.tokenAmount) / TOKEN_DEC, solAmountRaw: String(t.solAmount), tokenAmountRaw: String(t.tokenAmount),
           virtualSolReserves: String(t.virtualSolReserves), virtualTokenReserves: String(t.virtualTokenReserves), realTokenReserves: String(t.realTokenReserves),
           price: m.price, marketCapSol: m.marketCapSol, progress: m.progress, create: r.create, program: "pump", ...(nonSol ? { quoteNonSol: true } : {}), commitment: "processed", source: "logs", receivedAt: at,
           venue: "curve", priceSource: "curveEventReserves", priceValid: !nonSol && !bad && m.price != null, ...(nonSol ? { priceInvalidReason: "nonSolQuote" as const } : bad ? { priceInvalidReason: "badReserves" as const } : {}), tokenDecimals: 6,
           ...(r.completeMints.includes(t.mint) ? { complete: true } : {}) });
+        if (nonSol) void this.curveQuote(se, t).then(() => this.emit(se)); else this.emit(se);
         if (r.completeMints.includes(t.mint)) this.migration(t.mint, sig, e.slot, at);
       } else {
         const t = ev.t;
-        const base = (pool: Awaited<ReturnType<PumpEngine["pool"]>>) => this.emit(ammEvent(t, pool, sig, e.slot, at));
+        const base = (pool: Awaited<ReturnType<PumpEngine["pool"]>>) => {
+          const ev = ammEvent(t, pool, sig, e.slot, at);
+          if (pool && pool.quote !== WSOL && pool.base !== WSOL) {
+            const pq = pool.quoteDec != null && pool.baseDec != null && t.baseAfter > 0n ? (Number(t.quoteAfter) / 10 ** pool.quoteDec) / (Number(t.baseAfter) / 10 ** pool.baseDec) : null;
+            ev.quoteFeeRaw = String(t.fee);
+            void this.withQuote(ev, pool.quote, t.quoteAmount, pool.quoteDec, pq, "event").then(() => this.emit(ev));
+          } else this.emit(ev);
+        };
         const cached = this.pools.get(t.pool);
         // fast path: wallet-only listeners don't need the mint; still resolve it, but synchronously when cached
         if (cached) void cached.then(base); else void this.pool(t.pool).then(base);
@@ -310,7 +337,7 @@ export class PumpEngine {
     this.stats.events++;
     if (e.priceValid === undefined) { e.priceValid = e.price != null; e.venue ??= e.program === "pump" ? "curve" : "amm-other"; e.priceSource ??= "balanceDiff"; }
     this.guard(e);
-    if (e.solAmount < 0.000_01 && e.priceValid) e.dust = true;
+    if (solOf(e) < 0.000_01 && (e.priceValid || e.solEquivalent != null)) e.dust = true;
     if (this.solUsd) { e.solUsd = this.solUsd; e.priceUsd = e.priceValid && e.price != null ? e.price * this.solUsd : null; e.marketCapUsd = e.priceValid && e.marketCapSol != null ? e.marketCapSol * this.solUsd : null; }
     for (const h of this.hooks) try { h(e); } catch {}
     const ls = [...this.ls].filter((l) => this.match(l, e)); if (!ls.length) { this.track(e); return; }
@@ -325,7 +352,7 @@ export class PumpEngine {
       const tracked = !!e.mint && (l.m?.has(e.mint) || !!tag || l.tr.has(e.mint + "|curve") || l.tr.has(e.mint + "|amm"));
       if (e.mint && tag && l.p.trackTaggedMints !== false && !(l.m?.has(e.mint)) && (l.m?.size ?? 0) < 500) (l.m ??= new Set()).add(e.mint);
       // high/drawdown: valid prices only, per venue (curve vs canonical AMM), dust excluded
-      const use = tracked && e.priceValid && e.price != null && e.price > 0 && e.venue !== "amm-other" && !e.dust && e.solAmount >= (l.p.minSolForHigh ?? 0.001);
+      const use = tracked && e.priceValid && e.price != null && e.price > 0 && e.venue !== "amm-other" && !e.dust && solOf(e) >= (l.p.minSolForHigh ?? 0.001);
       if (use) {
         const k = `${e.mint}|${e.venue}`; let t = l.tr.get(k);
         if (!t) { if (l.tr.size >= 5000) l.tr.delete(l.tr.keys().next().value!); t = { sub: { high: e.price!, fired: new Set() } }; l.tr.set(k, t); }
@@ -339,10 +366,10 @@ export class PumpEngine {
       if (tracked) {
         const t = l.tr.get(`${e.mint}|${e.venue}`); const px = e.priceValid ? e.price : null;
         Object.assign(extra, { highSinceSubscribe: t?.sub.high ?? null, drawdownPct: t && px ? ddPct(t.sub, px) : null, highSinceFirstTag: t?.tag?.high ?? null, drawdownSinceTagPct: t?.tag && px ? ddPct(t.tag, px) : null, trackVenue: e.venue });
-        if (l.p.stats !== false && e.solAmount > 0) {
+        if (l.p.stats !== false && solOf(e) > 0) {
           let g = l.agg.get(e.mint!);
           if (!g) { if (l.agg.size >= 2000) l.agg.delete(l.agg.keys().next().value!); g = { buys: 0, sells: 0, buySol: 0, sellSol: 0, buyers: new Set(), sellers: new Set(), first: e.receivedAt, tagBuys: new Map(), conflFired: new Set() }; l.agg.set(e.mint!, g); }
-          if (e.side === "buy") { g.buys++; g.buySol += e.solAmount; if (g.buyers.size < 20000) g.buyers.add(e.wallet); } else { g.sells++; g.sellSol += e.solAmount; if (g.sellers.size < 20000) g.sellers.add(e.wallet); }
+          if (e.side === "buy") { g.buys++; g.buySol += solOf(e); if (g.buyers.size < 20000) g.buyers.add(e.wallet); } else { g.sells++; g.sellSol += solOf(e); if (g.sellers.size < 20000) g.sellers.add(e.wallet); }
           const win = (l.p.confluenceWindowSec ?? 600) * 1000;
           if (tag && e.side === "buy") g.tagBuys.set(e.wallet, { t: e.receivedAt, tag });
           for (const [w, v] of g.tagBuys) if (e.receivedAt - v.t > win) g.tagBuys.delete(w);
@@ -356,7 +383,7 @@ export class PumpEngine {
           if (tag || l.w?.has(e.wallet)) {
             const pk = `${e.wallet}|${e.mint}`; let x = l.pnl.get(pk);
             if (!x) { if (l.pnl.size >= 5000) l.pnl.delete(l.pnl.keys().next().value!); x = { boughtSol: 0, soldSol: 0, boughtTok: 0, soldTok: 0, buys: 0, sells: 0 }; l.pnl.set(pk, x); }
-            if (e.side === "buy") { x.buys++; x.boughtSol += e.solAmount; x.boughtTok += e.tokenAmount; } else { x.sells++; x.soldSol += e.solAmount; x.soldTok += e.tokenAmount; }
+            if (e.side === "buy") { x.buys++; x.boughtSol += solOf(e); x.boughtTok += e.tokenAmount; } else { x.sells++; x.soldSol += solOf(e); x.soldTok += e.tokenAmount; }
             extra.walletPnl = pnlView(x, px);
           }
         }
@@ -418,6 +445,89 @@ export class PumpEngine {
     let tx: any;
     for (let i = 0; i < 4 && !tx; i++) { try { tx = await this.rpc("getTransaction", [sig, { encoding: "jsonParsed", commitment: "confirmed", maxSupportedTransactionVersion: 1 }]); } catch {} if (!tx) await new Promise((r) => setTimeout(r, 500 * (i + 1))); }
     for (const e of balanceDiffEvents(tx, sig, slot, at)) this.emit(e);
+  }
+  private decs = new Map<string, Promise<number | null>>();
+  /** mint decimals (byte 44, SPL Token and Token-2022), cached */
+  decimals(mint: string) {
+    if (mint === WSOL) return Promise.resolve(9);
+    let p = this.decs.get(mint);
+    if (!p) { p = this.rpc("getAccountInfo", [mint, { encoding: "base64" }]).then((x) => { const b = Buffer.from(x.value.data[0], "base64"); return b.length >= 82 ? b[44] : null; }).catch(() => { this.decs.delete(mint); return null; }); this.decs.set(mint, p); if (this.decs.size > 20_000) this.decs.delete(this.decs.keys().next().value!); }
+    return p;
+  }
+  private qcache = new Map<string, { at: number; ttl: number; v: Promise<{ sol: number | null; via: string | null; reason?: string }> }>();
+  /** SOL per 1 ui unit of `mint`, from free on-chain sources: Pyth (stables), deepest PumpSwap mint/WSOL pool (>= 5 SOL), or a live SOL bonding curve */
+  quoteSol(mint: string, depth = 0): Promise<{ sol: number | null; via: string | null; reason?: string }> {
+    const c = this.qcache.get(mint); if (c && Date.now() - c.at < c.ttl) return c.v;
+    const v = (async (): Promise<{ sol: number | null; via: string | null; reason?: string }> => {
+      if (mint === WSOL) return { sol: 1, via: "wsol" };
+      if (STABLES[mint]) { const u = this.solUsd ?? await this.refreshSolUsd(); return u ? { sol: 1 / u, via: `pyth:${STABLES[mint]}` } : { sol: null, via: null, reason: "noSolUsd" }; }
+      const dec = await this.decimals(mint); if (dec == null) return { sol: null, via: null, reason: "unknownDecimals" };
+      // deepest PumpSwap pool vs WSOL, else vs a leg with its own SOL route (stables via Pyth, PUMP); >= 5 SOL of leg-side liquidity
+      let best: { sol: number; liq: number; pool: string; leg: string } | null = null;
+      for (const leg of [WSOL, ...Object.keys(STABLES), PUMP_TOKEN]) {
+        if (leg === mint) continue;
+        const ls = leg === WSOL ? { sol: 1 } : depth === 0 ? await this.quoteSol(leg, 1) : { sol: null };
+        if (ls.sol == null) continue;
+        const legDec = leg === WSOL ? 9 : await this.decimals(leg); if (legDec == null) continue;
+        const pools: string[] = [];
+        for (const [x, y] of [[43, 75], [75, 43]]) {
+          const r = await this.rpc("getProgramAccounts", [PUMP_AMM_PROGRAM, { encoding: "base64", dataSlice: { offset: 0, length: 0 }, filters: [{ memcmp: { offset: x, bytes: mint } }, { memcmp: { offset: y, bytes: leg } }] }]).catch(() => []);
+          for (const p of r ?? []) pools.push(p.pubkey);
+        }
+        if (!pools.length) continue;
+        const pa = await this.rpc("getMultipleAccounts", [pools.slice(0, 50), { encoding: "base64", dataSlice: { offset: 0, length: 203 } }]).catch(() => null);
+        const meta = (pa?.value ?? []).map((x: any, i: number) => { const d = x ? Buffer.from(x.data[0], "base64") : null; return d && d.length >= 203 ? { pool: pools[i], baseIsLeg: b58encode(d.subarray(43, 75)) === leg, bv: b58encode(d.subarray(139, 171)), qv: b58encode(d.subarray(171, 203)) } : null; }).filter(Boolean) as any[];
+        const va = meta.length ? await this.rpc("getMultipleAccounts", [meta.flatMap((m) => [m.bv, m.qv]), { encoding: "base64", dataSlice: { offset: 64, length: 8 } }]).catch(() => null) : null;
+        meta.forEach((m, i) => {
+          const amt = (j: number) => { const x = va?.value?.[j]; return x ? Number(Buffer.from(x.data[0], "base64").readBigUInt64LE(0)) : 0; };
+          const b = amt(2 * i), q = amt(2 * i + 1); const legRaw = m.baseIsLeg ? b : q, tokRaw = m.baseIsLeg ? q : b;
+          const liq = legRaw / 10 ** legDec * ls.sol!;
+          if (liq >= 5 && tokRaw > 0) { const sol = (legRaw / 10 ** legDec) / (tokRaw / 10 ** dec) * ls.sol!; if (!best || liq > best.liq) best = { sol, liq, pool: m.pool, leg }; }
+        });
+        if (best) break;
+      }
+      if (best) { const bb = best as any; return { sol: bb.sol, via: `pumpswap:${bb.pool}${bb.leg === WSOL ? "" : `:via:${STABLES[bb.leg] ?? bb.leg}`}` }; }
+      const cv = await this.curvePrice(mint).catch(() => null);
+      if (cv && !cv.complete && cv.price) return { sol: cv.price, via: `curve:${cv.bondingCurve}` };
+      return { sol: null, via: null, reason: "noSolRoute" };
+    })().catch(() => ({ sol: null, via: null, reason: "lookupFailed" }));
+    const ent = { at: Date.now(), ttl: 30_000, v }; this.qcache.set(mint, ent);
+    void v.then((r) => { if (r.sol == null) ent.ttl = 900_000; });
+    if (this.qcache.size > 5_000) this.qcache.delete(this.qcache.keys().next().value!);
+    return v;
+  }
+  /** attach quote amount / decimals / SOL equivalent to a non-SOL-quote swap */
+  async withQuote(e: PumpSwapEvent, qm: string, raw: bigint, qdec: number | null | undefined, priceQuote: number | null, src: "event" | "balanceDiff") {
+    if (qdec == null) qdec = await this.decimals(qm);
+    e.quoteMint = qm; e.quoteAmountRaw = String(raw); e.quoteDecimals = qdec; e.quoteAmount = qdec != null ? Number(raw) / 10 ** qdec : null; e.quoteSource = src;
+    e.priceQuote = priceQuote;
+    const r = await this.quoteSol(qm);
+    e.quoteSolRate = r.sol; e.solEquivalentSource = r.via;
+    e.solEquivalent = r.sol != null && e.quoteAmount != null ? e.quoteAmount * r.sol : null;
+    e.priceSol = r.sol != null && priceQuote != null ? priceQuote * r.sol : null;
+    if (e.solEquivalent == null) e.solEquivalentReason = r.reason ?? (qdec == null ? "unknownDecimals" : "unknown");
+    if (this.solUsd && e.priceSol != null) e.priceUsd = null; // priceUsd stays reserved for valid SOL prices; use priceSol * solUsd
+  }
+  private async curveQuote(e: PumpSwapEvent, t: ReturnType<typeof decodePumpTrade>) {
+    try {
+      if (t.quote) {
+        const qd = await this.decimals(t.quote.mint);
+        const pq = qd != null && t.virtualTokenReserves > 0n ? (Number(t.quote.virtualReserves) / 10 ** qd) / (Number(t.virtualTokenReserves) / TOKEN_DEC) : null;
+        await this.withQuote(e, t.quote.mint, t.quote.amount, qd, pq, "event"); e.quoteFeeRaw = String(t.quote.fee); return;
+      }
+      // event lacks the quote tail: user's token-balance diff (largest non-mint, non-SOL change) from the confirmed tx
+      let tx: any;
+      for (let i = 0; i < 3 && !tx; i++) { await new Promise((r) => setTimeout(r, 800 * (i + 1))); tx = await this.rpc("getTransaction", [e.signature, { encoding: "jsonParsed", commitment: "confirmed", maxSupportedTransactionVersion: 0 }]).catch(() => null); }
+      const pre = new Map<number, any>((tx?.meta?.preTokenBalances ?? []).map((b: any) => [b.accountIndex, b]));
+      let best: { mint: string; d: bigint; dec: number } | null = null;
+      for (const b of tx?.meta?.postTokenBalances ?? []) {
+        if (b.owner !== e.wallet || b.mint === e.mint || b.mint === WSOL) continue;
+        const d = BigInt(b.uiTokenAmount.amount) - BigInt(pre.get(b.accountIndex)?.uiTokenAmount?.amount ?? 0); const a = d < 0n ? -d : d;
+        if (a > 0n && (!best || a > (best.d < 0n ? -best.d : best.d))) best = { mint: b.mint, d, dec: b.uiTokenAmount.decimals };
+      }
+      if (best) await this.withQuote(e, best.mint, best.d < 0n ? -best.d : best.d, best.dec, null, "balanceDiff");
+      else e.solEquivalentReason = "quoteNotFound";
+    } catch { e.solEquivalentReason = "lookupFailed"; }
   }
   async curvePrice(mint: string) {
     if (!isPubkey(mint)) throw INVALID_PARAMS("pumpCurvePrice: mint must be a base58 pubkey");

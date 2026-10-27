@@ -1,7 +1,7 @@
 // Pump analytics on top of PumpEngine: per-wallet forward-return ranking (persisted) and launch-risk (creator share / bundles).
 import fs from "node:fs";
 import path from "node:path";
-import { PumpEngine, balanceDiffEvents, type PumpSwapEvent, type LaunchRisk, PUMP_PROGRAM, PUMP_AMM_PROGRAM } from "./pump.js";
+import { PumpEngine, balanceDiffEvents, type PumpSwapEvent, type LaunchRisk, PUMP_PROGRAM, PUMP_AMM_PROGRAM, solOf } from "./pump.js";
 import { INVALID_PARAMS } from "./errors.js";
 
 type Rpc = (m: string, p: any[]) => Promise<any>;
@@ -52,12 +52,12 @@ export class PumpAnalytics {
     const L = this.launches.get(e.mint); if (L) e.launchRisk = this.risk(L, e.slot);
     const tag = this.tagOf(e.wallet); if (!tag) return;
     const k = `${e.wallet}|${e.mint}`; const p = this.pos.get(k) ?? { boughtSol: 0, boughtTok: 0, soldSol: 0, soldTok: 0 };
-    if (e.side === "buy") { p.boughtSol += e.solAmount; p.boughtTok += e.tokenAmount; } else { p.soldSol += e.solAmount; p.soldTok += e.tokenAmount; }
+    if (e.side === "buy") { p.boughtSol += solOf(e); p.boughtTok += e.tokenAmount; } else { p.soldSol += solOf(e); p.soldTok += e.tokenAmount; }
     this.pos.set(k, p); this.dirty = true;
     if (e.side === "buy" && !this.sigs.has(e.signature + e.wallet)) {
       this.sigs.add(e.signature + e.wallet);
       const ok = e.priceValid && e.price != null && e.venue !== "amm-other";
-      this.trades.push({ sig: e.signature, wallet: e.wallet, tag, mint: e.mint, at: now, price: ok ? e.price : null, sol: e.solAmount, fwd: {}, src: "live" });
+      this.trades.push({ sig: e.signature, wallet: e.wallet, tag, mint: e.mint, at: now, price: ok ? e.price : null, sol: solOf(e), fwd: {}, src: "live" });
       if (this.trades.length > (this.o.maxTrades ?? 50_000)) this.trades.splice(0, 1000);
     }
   }

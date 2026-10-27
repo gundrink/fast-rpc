@@ -94,18 +94,40 @@ export function parsePumpLogs(logs: string[]) {
   return { events: out, create, complete, truncated: logs.some((l) => l.startsWith("Log truncated")) };
 }
 
-export interface PumpSubParams { wallets?: string[]; mints?: string[]; allSwaps?: boolean; tags?: Record<string, string>; confirmations?: boolean; position?: boolean }
+export interface PumpSubParams { wallets?: string[]; mints?: string[]; allSwaps?: boolean; tags?: Record<string, string>; confirmations?: boolean; position?: boolean;
+  /** drawdown thresholds in pct (e.g. [10,20,30]); one alert per threshold per high, re-armed on a new high */
+  drawdownAlerts?: number[]; /** emit {type:"rebound"} when price recovers this pct off the low after a drawdown alert */ reboundPct?: number;
+  /** default true: after a tagged wallet trades a mint, also stream all swaps on that mint */ trackTaggedMints?: boolean }
 export function validatePumpParams(p: any): PumpSubParams {
   if (p == null) p = {};
   if (typeof p !== "object" || Array.isArray(p)) throw INVALID_PARAMS("pumpSwapSubscribe: params[0] must be an object");
   for (const k of ["wallets", "mints"] as const) if (p[k] !== undefined && (!Array.isArray(p[k]) || p[k].length > 5000 || !p[k].every(isPubkey))) throw INVALID_PARAMS(`pumpSwapSubscribe: ${k} must be an array of base58 pubkeys (max 5000)`);
   if (p.tags !== undefined && (typeof p.tags !== "object" || Array.isArray(p.tags) || !Object.values(p.tags).every((v) => typeof v === "string" && v.length <= 64))) throw INVALID_PARAMS("pumpSwapSubscribe: tags must be {wallet: string}");
+  if (p.drawdownAlerts !== undefined && (!Array.isArray(p.drawdownAlerts) || p.drawdownAlerts.length > 20 || !p.drawdownAlerts.every((x: any) => typeof x === "number" && x > 0 && x < 100))) throw INVALID_PARAMS("pumpSwapSubscribe: drawdownAlerts must be up to 20 numbers in (0,100)");
+  if (p.reboundPct !== undefined && !(typeof p.reboundPct === "number" && p.reboundPct > 0 && p.reboundPct <= 1000)) throw INVALID_PARAMS("pumpSwapSubscribe: reboundPct must be a number in (0,1000]");
   if (!p.wallets?.length && !p.mints?.length && p.allSwaps !== true) throw INVALID_PARAMS("pumpSwapSubscribe: give wallets, mints, or allSwaps:true");
   return p;
 }
 
 type Rpc = (method: string, params: any[]) => Promise<any>;
-type Listener = { p: PumpSubParams; w?: Set<string>; m?: Set<string>; cb: (e: PumpSwapEvent) => void };
+type Basis = { high: number; fired: Set<number>; low?: number; rebounded?: boolean };
+type Track = { sub: Basis; tag?: Basis };
+type Listener = { p: PumpSubParams; w?: Set<string>; m?: Set<string>; cb: (e: any) => void; tr: Map<string, Track> };
+export interface DrawdownEvent { type: "drawdown" | "rebound"; mint: string; pct: number; threshold?: number; high: number; low?: number; price: number; basis: "subscribe" | "firstTag"; signature: string; slot: number; wallet: string; tag?: string; receivedAt: number }
+
+/** Update one basis with a new price; returns alerts to emit. */
+export function stepBasis(b: Basis, price: number, alerts: number[] = [], rebound?: number): { kind: "drawdown" | "rebound"; pct: number; threshold?: number; low?: number }[] {
+  const out: { kind: "drawdown" | "rebound"; pct: number; threshold?: number; low?: number }[] = [];
+  if (price > b.high) { b.high = price; b.fired.clear(); b.low = undefined; b.rebounded = false; return out; }
+  const dd = b.high > 0 ? (1 - price / b.high) * 100 : 0;
+  for (const t of [...alerts].sort((x, y) => x - y)) if (dd >= t && !b.fired.has(t)) { b.fired.add(t); out.push({ kind: "drawdown", pct: dd, threshold: t }); b.rebounded = false; }
+  if (b.fired.size) {
+    if (b.low === undefined || price < b.low) { b.low = price; b.rebounded = false; }
+    else if (rebound && !b.rebounded && price >= b.low * (1 + rebound / 100)) { b.rebounded = true; out.push({ kind: "rebound", pct: (price / b.low - 1) * 100, low: b.low }); }
+  }
+  return out;
+}
+const ddPct = (b: Basis | undefined, price: number) => (b && b.high > 0 ? Math.max(0, (1 - price / b.high) * 100) : null);
 
 /** Shared engine: one processed logsSubscribe per program while any listener exists. */
 export class PumpEngine {
@@ -118,7 +140,7 @@ export class PumpEngine {
   constructor(private hub: StreamHub, private rpc: Rpc, private opts: { commitment?: string; log?: (...a: any[]) => void } = {}) {}
 
   subscribe(p: PumpSubParams, cb: (e: PumpSwapEvent) => void) {
-    const l: Listener = { p, cb, w: p.wallets?.length ? new Set(p.wallets) : undefined, m: p.mints?.length ? new Set(p.mints) : undefined };
+    const l: Listener = { p, cb, tr: new Map(), w: p.wallets?.length ? new Set(p.wallets) : undefined, m: p.mints?.length ? new Set(p.mints) : undefined };
     this.ls.add(l); this.ensure();
     return () => { this.ls.delete(l); if (!this.ls.size) this.release(); };
   }
@@ -193,7 +215,27 @@ export class PumpEngine {
     let pct: number | null | undefined;
     if (e.side === "sell") { const b = this.pos.get(key); pct = b != null && b > 0n ? Math.min(1, Number(raw) / Number(b)) : null; }
     this.track(e);
-    for (const l of ls) { try { l.cb({ ...e, ...(pct !== undefined ? { pctOfPositionSold: pct } : {}), ...(l.p.tags?.[e.wallet] ? { tag: l.p.tags[e.wallet] } : {}) }); } catch {} }
+    for (const l of ls) {
+      const tag = l.p.tags?.[e.wallet];
+      const extra: any = {}; const alerts: DrawdownEvent[] = [];
+      if (e.mint && e.price != null && e.price > 0 && (l.m?.has(e.mint) || tag || l.tr.has(e.mint))) {
+        let t = l.tr.get(e.mint);
+        if (!t) { if (l.tr.size >= 5000) l.tr.delete(l.tr.keys().next().value!); t = { sub: { high: e.price, fired: new Set() } }; l.tr.set(e.mint, t); }
+        if (tag && !t.tag) {
+          t.tag = { high: e.price, fired: new Set() };
+          // follow every swap on a mint once a tagged wallet touches it, so its high/drawdown is real (trackTaggedMints:false disables)
+          if (l.p.trackTaggedMints !== false && (l.m?.size ?? 0) < 500) (l.m ??= new Set()).add(e.mint);
+        }
+        for (const [basis, b] of [["subscribe", t.sub], ["firstTag", t.tag]] as const) {
+          if (!b) continue;
+          for (const a of stepBasis(b, e.price, l.p.drawdownAlerts, l.p.reboundPct))
+            alerts.push({ type: a.kind, mint: e.mint, pct: Math.round(a.pct * 100) / 100, ...(a.threshold != null ? { threshold: a.threshold } : {}), high: b.high, ...(a.low != null ? { low: a.low } : {}), price: e.price, basis, signature: e.signature, slot: e.slot, wallet: e.wallet, ...(tag ? { tag } : {}), receivedAt: e.receivedAt });
+        }
+        Object.assign(extra, { highSinceSubscribe: t.sub.high, drawdownPct: ddPct(t.sub, e.price), highSinceFirstTag: t.tag?.high ?? null, drawdownSinceTagPct: ddPct(t.tag, e.price) });
+      }
+      try { l.cb({ type: "swap", ...e, ...(pct !== undefined ? { pctOfPositionSold: pct } : {}), ...(tag ? { tag } : {}), ...extra }); } catch {}
+      for (const a of alerts) try { l.cb(a); } catch {}
+    }
     // position lookups only for explicitly watched wallets (allSwaps would flood the upstream)
     const pl = ls.filter((l) => l.p.position !== false && l.w?.has(e.wallet));
     if (e.side === "sell" && pct == null && e.mint && pl.length) void this.positionFollowUp(e, pl);
@@ -211,7 +253,7 @@ export class PumpEngine {
       const pre = post + BigInt(e.tokenAmountRaw);
       this.pos.set(`${e.wallet}:${e.mint}`, post);
       const pct = pre > 0n ? Number(BigInt(e.tokenAmountRaw) * 10_000n / pre) / 10_000 : null;
-      for (const l of ls) if (l.p.position !== false) try { l.cb({ ...e, pctOfPositionSold: pct, update: "position", receivedAt: Date.now(), ...(l.p.tags?.[e.wallet] ? { tag: l.p.tags[e.wallet] } : {}) }); } catch {}
+      for (const l of ls) if (l.p.position !== false) try { l.cb({ type: "swap", ...e, pctOfPositionSold: pct, update: "position", receivedAt: Date.now(), ...(l.p.tags?.[e.wallet] ? { tag: l.p.tags[e.wallet] } : {}) }); } catch {}
     } catch {}
   }
   /** batched: one getSignatureStatuses per ~400ms for all pending sigs (max 256 per call) */
@@ -236,7 +278,7 @@ export class PumpEngine {
         if (x?.err || ++v.tries > 20) { this.pend.delete(k); continue; }
         if (x?.confirmationStatus === "confirmed" || x?.confirmationStatus === "finalized") {
           this.pend.delete(k);
-          for (const l of v.ls) if (this.ls.has(l)) try { l.cb({ ...v.e, commitment: "confirmed", update: "confirmed", receivedAt: Date.now(), ...(l.p.tags?.[v.e.wallet] ? { tag: l.p.tags[v.e.wallet] } : {}) }); } catch {}
+          for (const l of v.ls) if (this.ls.has(l)) try { l.cb({ type: "swap", ...v.e, commitment: "confirmed", update: "confirmed", receivedAt: Date.now(), ...(l.p.tags?.[v.e.wallet] ? { tag: l.p.tags[v.e.wallet] } : {}) }); } catch {}
         }
       }
     } catch {}

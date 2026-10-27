@@ -2,7 +2,7 @@ import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import WebSocket from "ws";
-import { createFastRpc, decodePumpTrade, decodeAmmEvent, parsePumpLogs, decodeBondingCurve, curveMetrics, curvePda, PUMP_DISC, b58decode, WSOL } from "../src/index.js";
+import { stepBasis, createFastRpc, decodePumpTrade, decodeAmmEvent, parsePumpLogs, decodeBondingCurve, curveMetrics, curvePda, PUMP_DISC, b58decode, WSOL } from "../src/index.js";
 import { startMockSolana, waitFor } from "./helpers.js";
 
 const fx = JSON.parse(fs.readFileSync(new URL("./fixtures/pump-logs.json", import.meta.url), "utf8"));
@@ -72,3 +72,44 @@ test("WS pumpSwapSubscribe: processed event, wallet tag, pctOfPositionSold follo
   ws.close(); await app.close();
 });
 void WSOL;
+
+test("stepBasis: once per threshold, re-arm on new high, rebound", () => {
+  const b = { high: 100, fired: new Set<number>() } as any; const A = [10, 20];
+  assert.deepEqual(stepBasis(b, 95, A, 5), []);
+  assert.deepEqual(stepBasis(b, 85, A, 5).map((x) => x.threshold), [10]);
+  assert.deepEqual(stepBasis(b, 86, A, 5), []);
+  assert.deepEqual(stepBasis(b, 75, A, 5).map((x) => x.threshold), [20]);
+  assert.deepEqual(stepBasis(b, 70, A, 5), []);
+  const r = stepBasis(b, 74, A, 5); assert.equal(r[0].kind, "rebound"); assert.equal(r[0].low, 70);
+  assert.deepEqual(stepBasis(b, 74.5, A, 5), []); // rebound once per low
+  assert.deepEqual(stepBasis(b, 110, A, 5), []); assert.equal(b.high, 110);
+  assert.deepEqual(stepBasis(b, 98, A, 5).map((x) => x.threshold), [10]); // re-armed
+});
+
+test("WS drawdown tracking: high/drawdown fields, firstTag basis follows the mint, alerts", async () => {
+  const W = "4F6ZbYX2ZRd7zV14zmY3dciTnm14hWD9prskde3dnPSa", O = "DbPzFfzmaFq1KHyqUk4SrfvQnXVokyui9sJg4a2JW8SK";
+  const app = createFastRpc({ api: { url: mock.httpUrl }, hub: { wsUrl: mock.wsUrl, lingerMs: 50 }, webhooks: false, chain: { detect: false } });
+  const port = await app.server.listen(0);
+  const ws = new WebSocket(`ws://127.0.0.1:${port}`); await new Promise((r) => ws.on("open", r));
+  const got: any[] = []; ws.on("message", (d) => got.push(JSON.parse(String(d))));
+  ws.send(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "pumpSwapSubscribe", params: [{ wallets: [W], tags: { [W]: "pump-confirm" }, drawdownAlerts: [10, 20], reboundPct: 5, position: false }] }));
+  ws.send(JSON.stringify({ jsonrpc: "2.0", id: 2, method: "pumpSwapSubscribe", params: [{ allSwaps: true, drawdownAlerts: [200] }] }));
+  await waitFor(() => got.filter((m) => m.id).length === 2 && mock.activeSubs("logsSubscribe") === 2);
+  assert.equal(got.find((m) => m.id === 2).error.code, -32602);
+  let i = 0;
+  const trade = (user: string, vsolSol: number) => mock.emit("logsSubscribe", { context: { slot: 10 + i }, value: { signature: `D${i++}`, err: null,
+    logs: [tradeLog({ mint: MINT, user, buy: true, sol: 1n, tok: 1n, vsol: BigInt(vsolSol * 1e9), vtok: 1_000_000_000_000_000n, rtok: 700_000_000_000_000n })] } });
+  trade(W, 30); await waitFor(() => got.some((m) => m.params?.result?.signature === "D0"));
+  for (const v of [26, 23, 24.5, 33, 29]) { trade(O, v); await waitFor(() => got.some((m) => m.params?.result?.signature === `D${i - 1}` && m.params.result.type === "swap")); }
+  await new Promise((r) => setTimeout(r, 100));
+  const res = got.filter((m) => m.method === "pumpSwapNotification").map((m) => m.params.result);
+  const swaps = res.filter((e) => e.type === "swap"), al = res.filter((e) => e.type !== "swap");
+  assert.equal(swaps.length, 6); // other wallet's swaps on the tagged mint are streamed
+  assert.equal(swaps[0].tag, "pump-confirm"); assert.equal(swaps[0].drawdownSinceTagPct, 0);
+  assert.ok(Math.abs(swaps[2].drawdownPct - 23.33) < 0.01); assert.ok(Math.abs(swaps[4].highSinceFirstTag - 3.3e-8) < 1e-15);
+  const dd = al.filter((a) => a.type === "drawdown");
+  assert.deepEqual(dd.map((a) => `${a.basis}:${a.threshold}`), ["subscribe:10", "firstTag:10", "subscribe:20", "firstTag:20", "subscribe:10", "firstTag:10"]);
+  assert.equal(al.filter((a) => a.type === "rebound").length, 2);
+  assert.equal(dd[0].mint, MINT); assert.ok(dd[0].high > dd[0].price);
+  ws.close(); await app.close();
+});

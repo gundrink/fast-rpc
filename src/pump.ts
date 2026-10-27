@@ -133,6 +133,7 @@ export function parsePumpLogs(logs: string[]) {
 export interface PumpSubParams { wallets?: string[]; mints?: string[]; allSwaps?: boolean; tags?: Record<string, string>; confirmations?: boolean; position?: boolean;
   /** drawdown thresholds in pct (e.g. [10,20,30]); one alert per threshold per high, re-armed on a new high */
   drawdownAlerts?: number[]; /** emit {type:"rebound"} when price recovers this pct off the low after a drawdown alert */ reboundPct?: number;
+  /** attach nearest support/resistance (`levels`) from candles; needs pump market enabled */ levels?: boolean;
   /** default true: after a tagged wallet trades a mint, also stream all swaps on that mint */ trackTaggedMints?: boolean;
   /** swaps below this SOL size don't move high/drawdown (default 0.001) */ minSolForHigh?: number;
   /** distinct tagged wallets buying the same mint within confluenceWindowSec (default 600) -> {type:"confluence"} at these counts */
@@ -286,6 +287,7 @@ export class PumpEngine {
       }
     }
   }
+  poolInfo(addr: string) { return this.pool(addr); }
   private pool(addr: string) {
     let p = this.pools.get(addr);
     if (!p) {

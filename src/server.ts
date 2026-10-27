@@ -1,5 +1,6 @@
 import { PumpEngine, validatePumpParams } from "./pump.js";
 import type { PumpAnalytics } from "./pump-analytics.js";
+import type { PumpMarket, Interval } from "./pump-market.js";
 import { isPubkey as isPk } from "./codec.js";
 import { parseTransactions, addressTransactions, HttpError } from "./history.js";
 import net from "node:net";
@@ -107,6 +108,14 @@ export class RpcServer {
     this.analytics = a;
     this.register("pumpWalletRanking", (q: any) => a.ranking(q ?? {}));
     this.register("pumpLaunchInfo", (mint: any, cfg: any) => a.launchInfo(mint, cfg ?? {}));
+    return this;
+  }
+  private market?: PumpMarket;
+  attachMarket(m: PumpMarket) {
+    this.market = m;
+    this.register("pumpCandles", (mint: any, cfg: any) => m.candles(mint, cfg ?? {}));
+    this.register("marketRegime", () => m.regime());
+    this.register("pumpMarketRegime", () => m.regime());
     return this;
   }
   attachStreams(hub: StreamHub, getTx?: GetTx) { this.hub = hub; this.getTx = getTx; return this; }
@@ -410,7 +419,7 @@ export class RpcServer {
     const send = (o: any) => { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(o)); };
 
     const one = async (r: any): Promise<JsonRpcReply | undefined> => {
-      const pm = typeof r?.method === "string" ? /^pump(Swap|Curve|Ranking)(Subscribe|Unsubscribe)$/.exec(r.method) : null;
+      const pm = typeof r?.method === "string" ? /^pump(Swap|Curve|Ranking|Candles|Regime)(Subscribe|Unsubscribe)$/.exec(r.method) : null;
       if (pm && r.jsonrpc === "2.0") {
         const id = typeof r.id === "string" || typeof r.id === "number" ? r.id : null;
         const type = `pump${pm[1]}`;
@@ -432,9 +441,23 @@ export class RpcServer {
             const push = () => { try { out("pumpRankingNotification", a.ranking(q)); } catch {} };
             const t = setInterval(push, every); t.unref?.(); setTimeout(push, 0);
             subs.set(sid, { type, detach: () => clearInterval(t) });
+          } else if (pm[1] === "Candles" || pm[1] === "Regime") {
+            if (!this.market) throw new RpcError(-32601, `${r.method}: pump market disabled (PUMP_MARKET=1)`);
+            const m = this.market;
+            if (pm[1] === "Regime") {
+              const every = Math.max(5, Math.min(3600, Number(p0?.intervalSec ?? 30))) * 1000;
+              const push = () => { try { out("pumpRegimeNotification", m.regime()); } catch {} };
+              const t = setInterval(push, every); t.unref?.(); setTimeout(push, 0);
+              subs.set(sid, { type, detach: () => clearInterval(t) });
+            } else {
+              const mint = typeof p0 === "string" ? p0 : p0?.mint; const iv = (Array.isArray(r.params) && r.params[1]?.interval) ?? p0?.interval ?? "1m";
+              const stop = m.subscribeCandles(mint, iv as Interval, (c) => out("pumpCandlesNotification", c));
+              subs.set(sid, { type, detach: stop });
+            }
           } else if (pm[1] === "Swap") {
-            const p = validatePumpParams(p0);
-            const stop = this.pump.subscribe(p, (e) => out("pumpSwapNotification", e));
+            const p = validatePumpParams(p0); const m = this.market;
+            if (p.levels && !m) throw new RpcError(-32601, "pumpSwapSubscribe: levels needs pump market (PUMP_MARKET=1)");
+            const stop = this.pump.subscribe(p, (e: any) => out("pumpSwapNotification", p.levels && m && e.type === "swap" && e.mint ? { ...e, levels: m.levels(e.mint, e.priceValid ? e.price : null) } : e));
             subs.set(sid, { type, detach: stop });
           } else {
             const mint = typeof p0 === "string" ? p0 : p0?.mint;

@@ -40,7 +40,7 @@ export function computeLevels(cs: Candle[], price: number) {
   return { support: fmt(below[0]), resistance: fmt(above[0]), supports: below.slice(0, 3).map(fmt), resistances: above.slice(0, 3).map(fmt), candles: cs.length };
 }
 
-export interface MarketOptions { maxTracked?: number; backfillTxs?: number; backfillPerMin?: number; now?: () => number }
+export interface MarketOptions { maxTracked?: number; backfillTxs?: number; backfillPerMin?: number; warmPerMin?: number; now?: () => number }
 
 export class PumpMarket {
   series = new Map<string, Series>();
@@ -97,10 +97,19 @@ export class PumpMarket {
       if (!r && e.create && this.recent.size < 20_000) { r = { at: now, high: px, last: px }; this.recent.set(e.mint, r); }
       if (r) { r.high = Math.max(r.high, px); r.last = px; }
     }
+    if (!e.dust && (this.eng.mintWatched?.(e.mint) || this.eng.watched?.(e.wallet) || this.eng.tagOf?.(e.wallet))) this.warm(e.mint, e.venue !== "curve" ? e.pool : undefined);
     const s = this.series.get(e.mint); if (!s || !valid) return;
     if (e.venue !== "curve") { s.venue = e.venue; s.pool = e.pool; } else s.venue ??= "curve";
     if (conv) s.quoteMint = e.quoteMint;
     this.add(s, e.blockTime ? Math.min(Math.max(now, e.blockTime * 1000), e.blockTime * 1000 + 999) : now, px, solOf(e), true);
+  }
+  /** auto-warm: one capped backfill per mint traded by subscribed/tagged wallets or on subscribed mints; at most warmPerMin new mints/min */
+  warmed = 0; private warmBudget = { at: 0, n: 0 };
+  warm(mint: string, pool?: string) {
+    const s = this.series.get(mint); if (s?.backfill) { s.lastUse = this.now(); return false; }
+    const now = this.now(); if (now - this.warmBudget.at > 60_000) this.warmBudget = { at: now, n: 0 };
+    if (this.warmBudget.n >= (this.o.warmPerMin ?? 20)) { this.track(mint); return false; }
+    this.warmBudget.n++; this.warmed++; void this.backfill(mint, pool).catch(() => {}); return true;
   }
   // ---- backfill: signatures on the bonding curve (or canonical pool) -> getTransaction -> trade events ----
   private budget(n: number) { const now = this.now(); if (now - this.bfBudget.at > 60_000) this.bfBudget = { at: now, n: 0 }; const cap = this.o.backfillPerMin ?? 600; if (this.bfBudget.n + n > cap) return false; this.bfBudget.n += n; return true; }
@@ -121,6 +130,7 @@ export class PumpMarket {
             let price: number | null = null, vol = 0;
             if (ev.k === "pump") {
               const t = ev.t; if (t.mint !== mint || t.virtualTokenReserves === 0n) continue;
+              s.venue ??= "curve";
               if (t.virtualSolReserves > 0n) { price = curveMetrics(t.virtualSolReserves, t.virtualTokenReserves, t.realTokenReserves).price; vol = Number(t.solAmount) / 1e9; }
               else if (t.quote) { // non-SOL-quote curve: quote price converted at the current on-chain route rate
                 const [qd, q] = await Promise.all([this.eng.decimals(t.quote.mint), this.eng.quoteSol(t.quote.mint)]);
@@ -128,13 +138,14 @@ export class PumpMarket {
                 price = (Number(t.quote.virtualReserves) / 10 ** qd) / (Number(t.virtualTokenReserves) / 1e6) * q.sol; vol = Number(t.quote.amount) / 10 ** qd * q.sol; s.quoteMint = t.quote.mint;
               } else continue;
             }
-            else { const info = await this.eng.poolInfo(ev.t.pool); const a = ammEvent(ev.t, info, "", 0, 0); if (a.mint !== mint || !a.priceValid) continue; price = a.price; vol = a.solAmount; }
+            else { const info = await this.eng.poolInfo(ev.t.pool); const a = ammEvent(ev.t, info, "", 0, 0); if (a.mint !== mint || !a.priceValid) continue; price = a.price; vol = a.solAmount; s.venue ??= a.venue; }
             if (price == null || !(price > 0) || vol < 0.00001) continue;
             this.add(s, bt, price, vol, false); trades++; from = from == null ? bt : Math.min(from, bt);
           }
         }
       }
       if (ok.length >= cap) capped = true;
+      if (!s.venue) { const c = await this.eng.curvePrice(mint).catch(() => null); s.venue = c && !c.complete ? "curve" : s.pool ? "amm" : undefined; }
       s.backfilled = { txs, trades, from, capped };
       return s.backfilled;
     })();
@@ -181,23 +192,27 @@ export class PumpMarket {
     const now = this.now(), sec = Math.floor(now / 1000);
     const chg = (w: number) => {
       const first = this.solHist[0], last = this.solHist[this.solHist.length - 1];
-      if (!last) return { pct: null, note: "no SOL/USD samples yet" };
-      if (!first || now - first.at < w * 1000 - 15_000) return { pct: null, note: `insufficient history: ${Math.round((now - (first?.at ?? now)) / 60_000)}m of ${w / 60}m since startup` };
+      if (!last) return { changePct: null, complete: false, note: "no SOL/USD samples yet" };
+      if (!first || now - first.at < w * 1000 - 15_000) return { changePct: null, complete: false, note: `insufficient history: ${Math.round((now - (first?.at ?? now)) / 60_000)}m of ${w / 60}m since startup` };
       const ref = [...this.solHist].reverse().find((x) => x.at <= now - w * 1000) ?? first;
-      return { pct: r6((last.p / ref.p - 1) * 100), from: ref.p, to: last.p };
+      return { changePct: r6((last.p / ref.p - 1) * 100), from: ref.p, to: last.p, complete: true };
     };
     const flowW = (w: number) => {
       const fs = this.flow.filter((b) => b.s > sec - w); const buy = fs.reduce((a, b) => a + b.buy, 0), sell = fs.reduce((a, b) => a + b.sell, 0);
       const cover = this.flow.length ? Math.min(w, sec - this.flow[0].s + 1) : 0;
-      return { buySol: r6(buy), sellSol: r6(sell), netSol: r6(buy - sell), buySellRatio: sell > 0 ? r6(buy / sell) : null, coveredSec: cover, complete: cover >= w };
+      const v = { buySol: r6(buy), sellSol: r6(sell), netSol: r6(buy - sell), buySellRatio: sell > 0 ? r6(buy / sell) : null };
+      // incomplete window: headline numbers are null (they would just repeat the shorter partial history); partial sums kept separately
+      return cover >= w ? { ...v, coveredSec: cover, complete: true } : { buySol: null, sellSol: null, netSol: null, buySellRatio: null, coveredSec: cover, complete: false, partial: v };
     };
     const rec = [...this.recent.values()].filter((r) => now - r.at >= 60_000);
     const dd = rec.filter((r) => r.last / r.high - 1 <= -0.3).length;
-    const net15 = flowW(900).netSol, solCh = chg(3600).pct;
-    const label = rec.length < 10 ? "unknown" : (dd / rec.length > 0.8 || net15 < 0) && (solCh == null || solCh <= 0) ? "risk-off" : dd / rec.length < 0.6 && net15 > 0 ? "risk-on" : "neutral";
+    const f5 = flowW(300), f15 = flowW(900), net = (f15.complete ? f15.netSol : f5.netSol) ?? 0, solCh = chg(3600).changePct ?? chg(900).changePct;
+    const warming = !f5.complete || rec.length < 10;
+    const label = warming ? null : (dd / rec.length > 0.8 || net < 0) && (solCh == null || solCh <= 0) ? "risk-off" : dd / rec.length < 0.6 && net > 0 ? "risk-on" : "neutral";
     return { generatedAt: now, solUsd: this.eng.solUsd, solChange: { "15m": chg(900), "1h": chg(3600) },
       netFlow: { "1m": flowW(60), "5m": flowW(300), "15m": flowW(900), "1h": flowW(3600) },
       recentCurveTokens: { window: "created in the last 60m (seen live), at least 1m old", count: rec.length, drawdownOver30Pct: dd, pct: rec.length ? r6(dd / rec.length * 100) : null },
-      label, note: "SOL/USD from Pyth on-chain samples since startup; flow = pump curve + canonical PumpSwap swaps (non-SOL quotes via solEquivalent)" };
+      label, labelStatus: warming ? "warming" : "ready", labelNote: warming ? `label needs a complete 5m flow window (${f5.coveredSec}/300s) and >=10 recent curve tokens (${rec.length})` : "uses 15m flow when complete, else 5m",
+      units: { changePct: "percent (5 = +5%)", recentCurveTokens_pct: "percent", flow: "SOL" }, note: "SOL/USD from Pyth on-chain samples since startup; flow = pump curve + canonical PumpSwap swaps (non-SOL quotes via solEquivalent)" };
   }
 }

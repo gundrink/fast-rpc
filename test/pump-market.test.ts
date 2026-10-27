@@ -58,13 +58,25 @@ test("marketRegime: SOL change insufficient then computed, net flow windows, dra
   let now = 1_000_000_000; const eng = stub();
   const m = new PumpMarket(eng, async () => [], { now: () => now }).start();
   const h = eng.hooks[0];
-  let r: any = m.regime(); assert.equal(r.solChange["15m"].pct, null);
+  let r: any = m.regime(); assert.equal(r.solChange["15m"].changePct, null); assert.equal(r.label, null); assert.equal(r.labelStatus, "warming");
   m.sample(); now += 10 * 60_000; eng.solUsd = 160; m.sample();
   r = m.regime(); assert.match(r.solChange["15m"].note, /insufficient/);
-  now += 6 * 60_000; eng.solUsd = 165; m.sample(); r = m.regime(); assert.equal(r.solChange["15m"].pct, 10); assert.equal(r.solChange["1h"].pct, null);
+  now += 6 * 60_000; eng.solUsd = 165; m.sample(); r = m.regime(); assert.equal(r.solChange["15m"].changePct, 10); assert.equal(r.solChange["1h"].changePct, null);
   for (let i = 0; i < 10; i++) { const mint = `Mint${i}`; h(sw({ mint, create: true, price: 1e-8 })); h(sw({ mint, price: 2e-8 })); if (i < 4) h(sw({ mint, side: "sell", solAmount: 0.5, price: 1e-8 })); }
-  r = m.regime(); assert.equal(r.netFlow["1m"].buySol, 20); assert.equal(r.netFlow["1m"].sellSol, 2); assert.equal(r.netFlow["1m"].netSol, 18);
+  r = m.regime(); assert.equal(r.netFlow["1m"].complete, false); assert.equal(r.netFlow["1m"].netSol, null); assert.equal(r.netFlow["1m"].partial.buySol, 20); assert.equal(r.netFlow["1m"].partial.sellSol, 2); assert.equal(r.netFlow["1m"].partial.netSol, 18);
   assert.equal(r.recentCurveTokens.count, 0); // too young
   now += 61_000; r = m.regime(); assert.equal(r.recentCurveTokens.count, 10); assert.equal(r.recentCurveTokens.drawdownOver30Pct, 4); assert.equal(r.recentCurveTokens.pct, 40);
+  now += 300_000; h(sw({ mint: "Late", solAmount: 1 })); r = m.regime(); assert.equal(r.netFlow["5m"].complete, true); assert.equal(r.netFlow["1h"].complete, false); assert.equal(r.netFlow["1h"].netSol, null);
+  assert.equal(r.labelStatus, "ready"); assert.ok(["risk-on", "neutral", "risk-off"].includes(r.label));
   m.close();
+});
+
+test("auto-warm: watched wallet / subscribed mint triggers one rate-limited backfill", async () => {
+  const sigs: string[] = []; const eng = stub({ watched: (w: string) => w === "TAG", mintWatched: () => false, tagOf: () => undefined });
+  const m = new PumpMarket(eng, async (meth: string, p: any[]) => { if (meth === "getSignaturesForAddress") sigs.push(p[0]); return []; }, { warmPerMin: 2 }).start();
+  const h = eng.hooks[0];
+  h(sw({ wallet: "TAG", mint: MINT })); h(sw({ wallet: "TAG", mint: MINT })); h(sw({ wallet: "X", mint: "So11111111111111111111111111111111111111112" }));
+  h(sw({ wallet: "TAG", mint: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY2NoAjW1dEYN6EM" })); h(sw({ wallet: "TAG", mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" }));
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(m.warmed, 2); assert.equal(sigs.length, 2); m.close();
 });

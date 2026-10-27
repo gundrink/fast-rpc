@@ -54,7 +54,7 @@ export interface PumpSwapEvent {
   dust?: boolean; tokenDecimals?: number;
   /** non-SOL quote (buy_v2/sell_v2 curves, non-WSOL PumpSwap pools): amounts in the quote token + SOL conversion (null + reason if no on-chain route) */
   quoteMint?: string; quoteAmountRaw?: string; quoteAmount?: number | null; quoteDecimals?: number | null; priceQuote?: number | null;
-  quoteSolRate?: number | null; solEquivalent?: number | null; priceSol?: number | null; solEquivalentSource?: string | null; solEquivalentReason?: string;
+  quoteSolRate?: number | null; solEquivalent?: number | null; priceSol?: number | null; solEquivalentSource?: string | null; solEquivalentReason?: string; priceSolReason?: string;
   quoteSource?: "event" | "balanceDiff"; /** fees in quote raw units (curve: fee + creator fee; pool: lp + protocol fee); quoteAmount is net of fees */ quoteFeeRaw?: string; solUsd?: number | null; priceUsd?: number | null; marketCapUsd?: number | null; complete?: boolean;
 }
 
@@ -186,15 +186,24 @@ const ddPct = (b: Basis | undefined, price: number) => (b && b.high > 0 ? Math.m
 
 export interface PoolInfo { base: string; quote: string; baseDec: number | null; quoteDec: number | null; canonical: boolean; creator?: string }
 
+/** for a pool without WSOL: true when pool.base is the quote-like asset, so the traded token is pool.quote */
+export function nonSolFlip(pool: { base: string; quote: string }) {
+  const q = (m: string) => m in STABLES || m === PUMP_TOKEN;
+  if (q(pool.base) !== q(pool.quote)) return q(pool.base);
+  return pool.quote.endsWith("pump") && !pool.base.endsWith("pump");
+}
 /** PumpSwap event -> swap event with explicit orientation (WSOL may be base or quote) and validity. */
 export function ammEvent(t: ReturnType<typeof decodeAmmEvent>, pool: PoolInfo | null, sig: string, slot: number, at: number): PumpSwapEvent {
   const solSide = !pool ? null : pool.quote === WSOL ? "quote" : pool.base === WSOL ? "base" : null;
-  const mint = !pool ? null : solSide === "quote" ? pool.base : solSide === "base" ? pool.quote : pool.base;
-  const tokDec = !pool ? null : solSide === "base" ? pool.quoteDec : pool.baseDec;
+  // non-SOL pools: token = base unless the base looks like the quote asset (stable / PUMP, or quote is a pump mint and base is not)
+  const flip = !!pool && !solSide && nonSolFlip(pool);
+  const mint = !pool ? null : solSide === "quote" ? pool.base : solSide === "base" ? pool.quote : flip ? pool.quote : pool.base;
+  const tokDec = !pool ? null : solSide === "base" || flip ? pool.quoteDec : pool.baseDec;
   // amounts/reserves per side; buy/sell is from the token's perspective (buying the token for SOL)
-  const solAmt = solSide === "base" ? t.baseAmount : t.quoteAmount, tokAmt = solSide === "base" ? t.quoteAmount : t.baseAmount;
-  const solRes = solSide === "base" ? t.baseAfter : t.quoteAfter, tokRes = solSide === "base" ? t.quoteAfter : t.baseAfter;
-  const side: "buy" | "sell" = solSide === "base" ? (t.buy ? "sell" : "buy") : (t.buy ? "buy" : "sell");
+  const inv = solSide === "base" || flip;
+  const solAmt = inv ? t.baseAmount : t.quoteAmount, tokAmt = inv ? t.quoteAmount : t.baseAmount;
+  const solRes = inv ? t.baseAfter : t.quoteAfter, tokRes = inv ? t.quoteAfter : t.baseAfter;
+  const side: "buy" | "sell" = inv ? (t.buy ? "sell" : "buy") : (t.buy ? "buy" : "sell");
   let reason: PumpSwapEvent["priceInvalidReason"];
   if (!pool) reason = "noPool"; else if (!solSide) reason = "nonSolPool"; else if (tokDec == null || solRes <= 0n || tokRes <= 0n) reason = "badReserves"; else if (!pool.canonical) reason = "nonCanonicalPool";
   const td = 10 ** (tokDec ?? 6);
@@ -235,6 +244,7 @@ export class PumpEngine {
   /** first tag any current subscriber gave this wallet */
   tagOf(wallet: string): string | undefined { for (const l of this.ls) { const t = l.p.tags?.[wallet]; if (t) return t; } return undefined; }
   /** wallets explicitly watched by current subscribers */
+  mintWatched(mint: string) { for (const l of this.ls) if (l.m?.has(mint)) return true; return false; }
   watched(wallet: string) { for (const l of this.ls) if (l.w?.has(wallet)) return true; return false; }
   subscribe(p: PumpSubParams, cb: (e: PumpSwapEvent) => void) {
     const l: Listener = { p, cb, tr: new Map(), agg: new Map(), pnl: new Map(), w: p.wallets?.length ? new Set(p.wallets) : undefined, m: p.mints?.length ? new Set(p.mints) : undefined };
@@ -276,9 +286,11 @@ export class PumpEngine {
         const base = (pool: Awaited<ReturnType<PumpEngine["pool"]>>) => {
           const ev = ammEvent(t, pool, sig, e.slot, at);
           if (pool && pool.quote !== WSOL && pool.base !== WSOL) {
-            const pq = pool.quoteDec != null && pool.baseDec != null && t.baseAfter > 0n ? (Number(t.quoteAfter) / 10 ** pool.quoteDec) / (Number(t.baseAfter) / 10 ** pool.baseDec) : null;
+            const f = nonSolFlip(pool);
+            const [qm, qd, qa, qr, td, tr] = f ? [pool.base, pool.baseDec, t.baseAmount, t.baseAfter, pool.quoteDec, t.quoteAfter] : [pool.quote, pool.quoteDec, t.quoteAmount, t.quoteAfter, pool.baseDec, t.baseAfter];
+            const pq = qd != null && td != null && tr > 0n ? (Number(qr) / 10 ** qd) / (Number(tr) / 10 ** td) : null;
             ev.quoteFeeRaw = String(t.fee);
-            void this.withQuote(ev, pool.quote, t.quoteAmount, pool.quoteDec, pq, "event").then(() => this.emit(ev));
+            void this.withQuote(ev, qm, qa, qd, pq, "event").then(() => this.emit(ev), () => this.emit(ev));
           } else this.emit(ev);
         };
         const cached = this.pools.get(t.pool);
@@ -336,6 +348,9 @@ export class PumpEngine {
     if (this.rej.size > 5_000) this.rej.delete(this.rej.keys().next().value!);
   }
   private emit(e: PumpSwapEvent) {
+    // priceSol on every swap: SOL-quote swaps mirror the valid price; null always carries priceSolReason
+    if (e.quoteMint == null && e.priceSol === undefined && (e as any).type !== "update") e.priceSol = e.priceValid && e.price != null ? e.price : null;
+    if (e.priceSol == null && !e.priceSolReason) e.priceSolReason = e.solEquivalentReason ?? (e.quoteMint ? "noSolRoute" : e.priceInvalidReason ?? (e.mint == null ? "noPool" : "unknown"));
     this.stats.events++;
     if (e.priceValid === undefined) { e.priceValid = e.price != null; e.venue ??= e.program === "pump" ? "curve" : "amm-other"; e.priceSource ??= "balanceDiff"; }
     this.guard(e);
@@ -508,6 +523,7 @@ export class PumpEngine {
     e.solEquivalent = r.sol != null && e.quoteAmount != null ? e.quoteAmount * r.sol : null;
     e.priceSol = r.sol != null && priceQuote != null ? priceQuote * r.sol : null;
     if (e.solEquivalent == null) e.solEquivalentReason = r.reason ?? (qdec == null ? "unknownDecimals" : "unknown");
+    if (e.priceSol == null) e.priceSolReason = r.sol == null ? e.solEquivalentReason ?? r.reason ?? "noSolRoute" : priceQuote == null ? "noPriceQuote" : "unknown";
     if (this.solUsd && e.priceSol != null) e.priceUsd = null; // priceUsd stays reserved for valid SOL prices; use priceSol * solUsd
   }
   private async curveQuote(e: PumpSwapEvent, t: ReturnType<typeof decodePumpTrade>) {

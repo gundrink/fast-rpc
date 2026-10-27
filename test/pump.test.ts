@@ -185,3 +185,14 @@ test("v2 non-SOL quote: decode quote tail from real buy_v2 event, SOL equivalent
   await eng.withQuote(n, "11111111111111111111111111111112", 5n, 6, null, "event");
   assert.equal(n.solEquivalent, null); assert.equal(n.solEquivalentReason, "noSolRoute"); assert.equal(solOf(n), 0);
 });
+
+test("nonSolFlip: token side of non-WSOL pools", async () => {
+  const { nonSolFlip, ammEvent } = await import("../src/index.js");
+  const USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", TOK = "Ga1Txxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxpump", XS = "Xsc9qvGRxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+  assert.equal(nonSolFlip({ base: USDC, quote: TOK }), true);
+  assert.equal(nonSolFlip({ base: TOK, quote: USDC }), false);
+  assert.equal(nonSolFlip({ base: XS, quote: TOK }), true);
+  const t: any = { pool: "P", user: "U", timestamp: 1n, buy: true, baseAmount: 1_000_000n, quoteAmount: 5_000_000n, baseAfter: 100_000_000n, quoteAfter: 500_000_000n, fee: 0n };
+  const e = ammEvent(t, { base: XS, quote: TOK, baseDec: 8, quoteDec: 6, canonical: false }, "s", 1, 0);
+  assert.equal(e.mint, TOK); assert.equal(e.side, "sell"); assert.equal(e.tokenAmount, 5);
+});

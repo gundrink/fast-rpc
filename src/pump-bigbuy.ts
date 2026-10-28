@@ -1,7 +1,7 @@
 // Big-buy listener: every buy >= minSol on pump.fun curve / PumpSwap, with wallet insight (creator, wallet age, repeat behavior,
 // in-memory position PnL on mints it big-bought, and a win rate on prior big buys). Persisted to a JSON file.
 import fs from "node:fs"; import path from "node:path";
-import { solOf, type PumpEngine, type PumpSwapEvent } from "./pump.js";
+import { solOf, solAmountOf, type PumpEngine, type PumpSwapEvent } from "./pump.js";
 import type { PumpFlow } from "./pump-flow.js";
 import { INVALID_PARAMS } from "./errors.js";
 import { isPubkey } from "./codec.js";
@@ -33,7 +33,7 @@ export class PumpBigBuys {
 
   onSwap(e: PumpSwapEvent) {
     if (!e.mint || e.update || e.dust || !e.wallet) return;
-    const now = this.now(); const conv = e.solEquivalent != null || !e.quoteMint; const sol = conv ? solOf(e) : null;
+    const now = this.now(); const sol = solAmountOf(e).sol;
     const px = e.quoteMint ? (e as any).priceSol ?? null : e.priceValid ? e.price : null;
     // settle outcomes of prior big buys on this mint (first valid price >= evalSec after the buy)
     const pend = this.pending.get(e.mint);

@@ -41,7 +41,7 @@ export function createFastRpc(opts: FastRpcOptions = {}) {
       for (const [tree, t] of cnft.trees) if (t.seq === 0) void cnft.backfill(rpc, tree).catch((e) => opts.cnft?.log?.("[cnft] backfill failed", tree, e?.message));
   }
   const server = new RpcServer(opts.server).attachStreams(hub, getTx).registerAll(api).attachChain(chain);
-  const pump = new PumpEngine(hub, rpc as any);
+  const pump = new PumpEngine(hub, rpc as any, { jupPrice: process.env.PUMP_JUP_PRICE !== "0" });
   server.attachPump(pump);
   const analytics = opts.pumpAnalytics ? new PumpAnalytics(pump, rpc as any, opts.pumpAnalytics).start() : undefined;
   const market = opts.pumpMarket ? new PumpMarket(pump, rpc as any, opts.pumpMarket).start() : undefined;

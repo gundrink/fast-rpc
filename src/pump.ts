@@ -17,6 +17,17 @@ export const PUMP_TOKEN = "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn";
 export const STABLES: Record<string, string> = { EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v: "USDC", Es9vMFrzaCERmJfrF4H2FYD4KCoNkY2NoAjW1dEYN6EM: "USDT", USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB: "USD1" };
 /** SOL value of a swap: solAmount, or solEquivalent for non-SOL quotes */
 export const solOf = (e: { solAmount: number; solEquivalent?: number | null }) => e.solEquivalent ?? e.solAmount;
+/** SOL size of a swap for alerts/filters: SOL-quoted curve -> TradeEvent sol_amount; SOL PumpSwap pool -> event quote (SOL) amount;
+ *  non-SOL quote -> solEquivalent; else priceSol x tokenAmount estimate; else null + reason */
+export function solAmountOf(e: { solAmount: number; tokenAmount?: number; quoteMint?: string; solEquivalent?: number | null; solEquivalentReason?: string; priceSol?: number | null; venue?: string }):
+  { sol: number | null; source: "event" | "solEquivalent" | "priceEstimate" | null; reason?: string } {
+  const solQuoted = !e.quoteMint || e.quoteMint === "So11111111111111111111111111111111111111112";
+  if (solQuoted && e.solAmount > 0) return { sol: e.solAmount, source: "event" };
+  if (e.solEquivalent != null) return { sol: e.solEquivalent, source: "solEquivalent" };
+  if (e.priceSol != null && e.priceSol > 0 && e.tokenAmount) return { sol: e.priceSol * e.tokenAmount, source: "priceEstimate" };
+  if (solQuoted) return { sol: e.solAmount ?? 0, source: "event" };
+  return { sol: null, source: null, reason: e.solEquivalentReason ?? "noSolRoute" };
+}
 export function decodePythPrice(b: Buffer) {
   if (b.length < 100) return null;
   const o = 40 + (b[40] === 0 ? 2 : 1) + 32;
@@ -256,7 +267,7 @@ export class PumpEngine {
   private migration(mint: string, sig: string, slot: number, at: number) {
     for (const l of this.ls) if (l.m?.has(mint) || l.tr.has(mint + "|curve") || l.p.allSwaps) try { l.cb({ type: "migration", mint, signature: sig, slot, receivedAt: at, note: "bonding curve complete; further prices come from venue amm" }); } catch {}
   }
-  constructor(private hub: StreamHub, private rpc: Rpc, private opts: { commitment?: string; log?: (...a: any[]) => void; solUsd?: boolean } = {}) {}
+  constructor(private hub: StreamHub, private rpc: Rpc, private opts: { commitment?: string; log?: (...a: any[]) => void; solUsd?: boolean; jupPrice?: boolean } = {}) {}
 
   /** analytics hooks: see every swap event (after validity/USD enrichment) before listeners; may add fields */
   hooks: ((e: PumpSwapEvent) => void)[] = [];
@@ -527,12 +538,22 @@ export class PumpEngine {
       if (best) { const bb = best as any; return { sol: bb.sol, via: `pumpswap:${bb.pool}${bb.leg === WSOL ? "" : `:via:${STABLES[bb.leg] ?? bb.leg}`}` }; }
       const cv = await this.curvePrice(mint).catch(() => null);
       if (cv && !cv.complete && cv.price) return { sol: cv.price, via: `curve:${cv.bondingCurve}` };
+      // off-PumpSwap quotes (xStocks, bridged BTC, other-DEX tokens): free keyless Jupiter lite price, >= $50k liquidity
+      if (this.opts.jupPrice) { const j = await this.jupSol(mint); if (j) return j; }
       return { sol: null, via: null, reason: "noSolRoute" };
     })().catch(() => ({ sol: null, via: null, reason: "lookupFailed" }));
     const ent = { at: Date.now(), ttl: 30_000, v }; this.qcache.set(mint, ent);
     void v.then((r) => { if (r.sol == null) ent.ttl = 900_000; });
     if (this.qcache.size > 5_000) this.qcache.delete(this.qcache.keys().next().value!);
     return v;
+  }
+  private async jupSol(mint: string): Promise<{ sol: number; via: string } | null> {
+    try {
+      const r = await fetch(`https://lite-api.jup.ag/price/v3?ids=${mint},${WSOL}`, { signal: AbortSignal.timeout(4000) }); if (!r.ok) return null;
+      const j: any = await r.json(); const m = j?.[mint], w = j?.[WSOL];
+      if (!(m?.usdPrice > 0) || !(w?.usdPrice > 0) || !(m.liquidity >= 50_000)) return null;
+      return { sol: m.usdPrice / w.usdPrice, via: "jupiter:lite" };
+    } catch { return null; }
   }
   /** attach quote amount / decimals / SOL equivalent to a non-SOL-quote swap */
   async withQuote(e: PumpSwapEvent, qm: string, raw: bigint, qdec: number | null | undefined, priceQuote: number | null, src: "event" | "balanceDiff") {

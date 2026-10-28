@@ -1,0 +1,5 @@
+curve: alerts 91, solAmount null 3 (3.3%) reasons {"noSolRoute":3}
+amm: alerts 25, solAmount null 0 (0.0%) reasons {}
+amm-other: alerts 85, solAmount null 0 (0.0%) reasons {}
+curve sell swaps 1185; with quoteMint set 175; solAmount>0 1010
+example null curve alert {"type":"largeSell","mint":"4benEBWHbP3onqPzwNXJq6KuEXTuhnhDhqkYvsE6pump","wallet":"4fwY2VzDsPjZ787BbVnVEVbzRQ6noiwoGPAMPuRTERp1","signature":"ky7zS1QMAY9S9jPwksEa7VVJAzZ1PBqvx2uAiRMYsGngDB7aWVfG67JYP7qBAb4L629DztvpBp4FzekEBoMNYLG","slot":462379519,"blockTime":1793169882,"solAmount":null,"solAmountSource":null,"solAmountReason":"noSolRoute","tokenAmount":1482332.782798,"pctOfPositionSold":100,"positionBeforeTokens":1482332.782798,"venue":"curve","receivedAt":1793169883764}

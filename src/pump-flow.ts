@@ -1,5 +1,5 @@
 // Trending tokens + per-mint flow metrics + large-seller / dev-sell alerts on top of PumpEngine (all swaps, in memory since startup).
-import { PumpEngine, curvePda, solOf, type PumpSwapEvent } from "./pump.js";
+import { PumpEngine, curvePda, solOf, solAmountOf, type PumpSwapEvent } from "./pump.js";
 import { INVALID_PARAMS } from "./errors.js";
 import { isPubkey, b58encode } from "./codec.js";
 
@@ -48,7 +48,7 @@ export class PumpFlow {
     if (e.venue === "curve" && typeof e.progress === "number") b.prog = e.progress;
     if (px != null || !st.last) st.last = { price: px, priceSol: px, priceUsd: px != null && e.solUsd ? px * e.solUsd : null, marketCapSol: e.marketCapSol ?? null, marketCapUsd: e.marketCapUsd ?? null,
       liquiditySol: e.liquiditySol ?? null, liquidityUsd: e.liquidityUsd ?? null, liquidityReason: e.liquidityReason, progress: e.venue === "curve" ? e.progress ?? null : e.venue === "amm" ? 100 : null, venue: e.venue, quoteMint: e.quoteMint ?? null, at: now };
-    if (e.side === "sell") this.checkSell(st, e, v, conv);
+    if (e.side === "sell") this.checkSell(st, e);
   }
   private prune(now: number) { const old = [...this.stats.values()].sort((a, b) => (a.b[a.b.length - 1]?.s ?? 0) - (b.b[b.b.length - 1]?.s ?? 0)); for (const x of old.slice(0, Math.ceil(old.length / 10))) this.stats.delete(x.mint); }
 
@@ -63,12 +63,13 @@ export class PumpFlow {
     const p = (st as any).creatorP = this.eng.curvePrice(st.mint).catch(() => null).then((c: any) => { st.creator = c?.creator ?? null; (st as any).creatorP = undefined; return st.creator; });
     return p;
   }
-  private checkSell(st: MintStat, e: PumpSwapEvent, sol: number, conv: boolean) {
+  private checkSell(st: MintStat, e: PumpSwapEvent) {
+    const so = solAmountOf(e); const sol = so.sol;
     if (!this.interested(st.mint)) return;
     void (async () => {
       const creator = await this.creatorOf(st);
       const isDev = creator != null && e.wallet === creator;
-      const wantLarge = [...this.subs].some((x) => (x.cfg.allMints || x.set?.has(st.mint)) && x.cfg.largeSellPct != null && (!conv || sol >= (x.cfg.minSellSol ?? 0.5)));
+      const wantLarge = [...this.subs].some((x) => (x.cfg.allMints || x.set?.has(st.mint)) && x.cfg.largeSellPct != null && (sol != null ? sol >= (x.cfg.minSellSol ?? 0.5) : (x.cfg.minSellSol ?? 0.5) <= 0));
       if (!isDev && !wantLarge) return;
       // exact share of the wallet's position sold: pre/post token balances from the confirmed tx (budgeted)
       let pct: number | null = null, reason: string | undefined, pre: number | null = null;
@@ -84,11 +85,11 @@ export class PumpFlow {
           if (a > 0) pct = Math.min(100, Math.max(0, (a - b) / a * 100)); else reason = "noPreBalance";
         }
       }
-      const base = { mint: st.mint, wallet: e.wallet, signature: e.signature, slot: e.slot, blockTime: e.blockTime ?? null, solAmount: conv ? r6(sol) : null, ...(conv ? {} : { solAmountReason: e.solEquivalentReason ?? "noSolRoute" }),
+      const base = { mint: st.mint, wallet: e.wallet, signature: e.signature, slot: e.slot, blockTime: e.blockTime ?? null, solAmount: sol != null ? r6(sol) : null, solAmountSource: so.source, ...(sol == null ? { solAmountReason: so.reason } : {}),
         tokenAmount: e.tokenAmount, pctOfPositionSold: pct != null ? Math.round(pct * 100) / 100 : null, ...(pct == null ? { pctOfPositionSoldReason: reason ?? "unknown" } : {}), positionBeforeTokens: pre, venue: e.venue, receivedAt: e.receivedAt };
       const fire = (a: any) => { st.alerts.push(a); if (st.alerts.length > 50) st.alerts.shift(); for (const x of this.subs) if (x.cfg.allMints || x.set?.has(st.mint)) {
         if (a.type === "devSell" && x.cfg.devSells === false) continue;
-        if (a.type === "largeSell" && (x.cfg.largeSellPct == null || a.pctOfPositionSold == null || a.pctOfPositionSold < x.cfg.largeSellPct || (a.solAmount != null && a.solAmount < (x.cfg.minSellSol ?? 0.5)))) continue;
+        if (a.type === "largeSell" && (x.cfg.largeSellPct == null || a.pctOfPositionSold == null || a.pctOfPositionSold < x.cfg.largeSellPct || (a.solAmount != null ? a.solAmount < (x.cfg.minSellSol ?? 0.5) : (x.cfg.minSellSol ?? 0.5) > 0))) continue;
         try { x.cb(a); } catch {} } };
       if (isDev) st.devSoldAt = this.now();
       if (isDev) fire({ type: "devSell", creator, ...base });

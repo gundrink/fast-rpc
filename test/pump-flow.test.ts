@@ -99,3 +99,24 @@ test("curve screener: gPA holders, age from oldest signature, bundled flag, eta,
   const n = calls.getProgramAccounts; await f.curveScreener({}); assert.equal(calls.getProgramAccounts, n, "enrichment cached");
   await assert.rejects(f.curveScreener({ maxBonding: 200 }), /maxBonding/); await assert.rejects(f.curveScreener({ sort: "x" }), /sort one of/);
 });
+
+test("largeSell solAmount: curve SOL / WSOL-quoted from event, non-SOL via solEquivalent or priceSol estimate, minSellSol applied, unknown only fires at minSellSol 0", async () => {
+  const eng = stub(); const W = "So11111111111111111111111111111111111111112";
+  const rpc = async (m: string, p: any[]) => m === "getTransaction" ? { meta: { preTokenBalances: [{ owner: String(p[0]).slice(2), mint: M, uiTokenAmount: { amount: "1000" } }], postTokenBalances: [] } } : null;
+  const f = new PumpFlow(eng, rpc, { now: () => 1_000_000_000 }).start(); const h = eng.hooks[0];
+  const got: any[] = [], got0: any[] = []; f.watch({ mints: [M], largeSellPct: 50, minSellSol: 1 }, (a) => got.push(a)); f.watch({ mints: [M], largeSellPct: 50, minSellSol: 0 }, (a) => got0.push(a));
+  h(sw({ signature: "S-A", wallet: "A", side: "sell", solAmount: 2 }));                                            // plain curve
+  h(sw({ signature: "S-B", wallet: "B", side: "sell", solAmount: 3, quoteMint: W }));                              // WSOL-tagged, no solEquivalent
+  h(sw({ signature: "S-C", wallet: "C", side: "sell", solAmount: 0, quoteMint: "Q", solEquivalent: 4 }));         // non-SOL converted
+  h(sw({ signature: "S-D", wallet: "D", side: "sell", solAmount: 0, quoteMint: "Q", priceSol: 0.002, tokenAmount: 1000 })); // estimate = 2 SOL
+  h(sw({ signature: "S-E", wallet: "E", side: "sell", solAmount: 0, quoteMint: "Q", solEquivalentReason: "noSolRoute" })); // unknown
+  h(sw({ signature: "S-F", wallet: "F", side: "sell", solAmount: 0.3 }));                                          // below minSellSol 1
+  await tick(); await tick();
+  const by = (w: string, l = got) => l.find((a) => a.wallet === w);
+  assert.equal(by("A").solAmount, 2); assert.equal(by("A").solAmountSource, "event");
+  assert.equal(by("B").solAmount, 3); assert.equal(by("B").solAmountSource, "event");
+  assert.equal(by("C").solAmount, 4); assert.equal(by("C").solAmountSource, "solEquivalent");
+  assert.equal(by("D").solAmount, 2); assert.equal(by("D").solAmountSource, "priceEstimate");
+  assert.equal(by("E"), undefined); assert.equal(by("F"), undefined);
+  const e0 = by("E", got0); assert.ok(e0); assert.equal(e0.solAmount, null); assert.equal(e0.solAmountReason, "noSolRoute"); assert.ok(by("F", got0));
+});

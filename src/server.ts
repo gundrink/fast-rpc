@@ -2,6 +2,7 @@ import { PumpEngine, validatePumpParams } from "./pump.js";
 import type { PumpAnalytics } from "./pump-analytics.js";
 import type { PumpMarket, Interval } from "./pump-market.js";
 import type { PumpFlow } from "./pump-flow.js";
+import type { PumpBigBuys } from "./pump-bigbuy.js";
 import { isPubkey as isPk } from "./codec.js";
 import { parseTransactions, addressTransactions, HttpError } from "./history.js";
 import net from "node:net";
@@ -117,6 +118,14 @@ export class RpcServer {
     this.register("pumpCandles", (mint: any, cfg: any) => m.candles(mint, cfg ?? {}));
     this.register("marketRegime", () => m.regime());
     this.register("pumpMarketRegime", () => m.regime());
+    return this;
+  }
+  private bigM?: PumpBigBuys;
+  attachBigBuys(b: PumpBigBuys) {
+    this.bigM = b;
+    this.register("pumpBigBuys", (q: any) => b.recent(q ?? {}));
+    this.register("pumpBigBuyers", (q: any) => b.rank(q ?? {}));
+    this.register("pumpBigBuyWallet", (w: any) => { if (typeof w !== "string") throw new RpcError(-32602, "pumpBigBuyWallet: params [wallet]"); return { wallet: w, ...b.walletView(w) }; });
     return this;
   }
   private flowM?: PumpFlow;
@@ -429,7 +438,7 @@ export class RpcServer {
     const send = (o: any) => { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(o)); };
 
     const one = async (r: any): Promise<JsonRpcReply | undefined> => {
-      const pm = typeof r?.method === "string" ? /^pump(Swap|Curve|Ranking|Candles|Regime|Trending|Flow|CurveScreener)(Subscribe|Unsubscribe)$/.exec(r.method) : null;
+      const pm = typeof r?.method === "string" ? /^pump(Swap|Curve|Ranking|Candles|Regime|Trending|Flow|CurveScreener|BigBuy)(Subscribe|Unsubscribe)$/.exec(r.method) : null;
       if (pm && r.jsonrpc === "2.0") {
         const id = typeof r.id === "string" || typeof r.id === "number" ? r.id : null;
         const type = `pump${pm[1]}`;
@@ -451,6 +460,10 @@ export class RpcServer {
             const push = () => { try { out("pumpRankingNotification", a.ranking(q)); } catch {} };
             const t = setInterval(push, every); t.unref?.(); setTimeout(push, 0);
             subs.set(sid, { type, detach: () => clearInterval(t) });
+          } else if (pm[1] === "BigBuy") {
+            if (!this.bigM) throw new RpcError(-32601, `${r.method}: pump market disabled (PUMP_MARKET=1)`);
+            const stop = this.bigM.subscribe(p0 ?? {}, (x) => out("pumpBigBuyNotification", x));
+            subs.set(sid, { type, detach: () => { stop(); } });
           } else if (pm[1] === "CurveScreener") {
             if (!this.flowM) throw new RpcError(-32601, `${r.method}: pump market disabled (PUMP_MARKET=1)`);
             const f = this.flowM; const q = { ...(p0 ?? {}) }; delete (q as any).intervalSec;

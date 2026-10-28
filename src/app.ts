@@ -7,6 +7,7 @@ import { PumpEngine } from "./pump.js";
 import { PumpAnalytics, type AnalyticsOptions } from "./pump-analytics.js";
 import { PumpMarket, type MarketOptions } from "./pump-market.js";
 import { PumpFlow } from "./pump-flow.js";
+import { PumpBigBuys } from "./pump-bigbuy.js";
 import { CnftIndexer, type IndexerOptions } from "./bubblegum.js";
 
 export interface FastRpcOptions {
@@ -46,7 +47,9 @@ export function createFastRpc(opts: FastRpcOptions = {}) {
   const market = opts.pumpMarket ? new PumpMarket(pump, rpc as any, opts.pumpMarket).start() : undefined;
   const flow = opts.pumpMarket ? new PumpFlow(pump, rpc as any).start() : undefined;
   if (market) server.attachMarket(market);
+  const bigBuys = flow ? new PumpBigBuys(pump, rpc as any, flow, { dataFile: process.env.PUMP_BIGBUY_FILE ?? "data/pump-bigbuys.json" }).start() : undefined;
   if (flow) server.attachFlow(flow);
+  if (bigBuys) server.attachBigBuys(bigBuys);
   if (analytics) {
     server.attachAnalytics(analytics);
     if ((opts.pumpAnalytics as any).backfill && opts.pumpAnalytics && opts.pumpAnalytics.wallets) void analytics.backfill([...opts.pumpAnalytics.wallets.keys()], { log: console.log }).catch(() => {});
@@ -59,7 +62,7 @@ export function createFastRpc(opts: FastRpcOptions = {}) {
   if (detect) { const t = setInterval(() => void chain.detect(detectUp), co.redetectMs ?? 600_000); t.unref(); timers.push(t); }
   const track = (co.trackSlots ?? process.env.CHAIN_TRACK_SLOTS === "1") ? hub.subscribe("slot", {}, { deliver: () => {} }) : undefined;
   return {
-    server, hub, api, pump, analytics, market, flow, webhooks, chain, cnft, ready,
-    close: async () => { for (const t of timers) clearInterval(t); track?.detach(); webhooks?.close(); cnft.stop(); analytics?.close(); market?.close(); flow?.close(); await server.close(); hub.close(); },
+    server, hub, api, pump, analytics, market, flow, bigBuys, webhooks, chain, cnft, ready,
+    close: async () => { for (const t of timers) clearInterval(t); track?.detach(); webhooks?.close(); cnft.stop(); analytics?.close(); market?.close(); flow?.close(); bigBuys?.close(); await server.close(); hub.close(); },
   };
 }

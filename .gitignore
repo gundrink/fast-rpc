@@ -5,3 +5,4 @@ dist/
 tpu-sidecar/target/
 data/pump-analytics.json*
 data/pump-candles/
+data/pump-bigbuys.json*

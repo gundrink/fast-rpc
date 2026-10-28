@@ -5,7 +5,7 @@ export interface KeyLimit { rps?: number; burst?: number; credits?: number }
 const COST: Record<string, number> = {
   getProgramAccounts: 10, getBlock: 5, getTransaction: 2, getSignaturesForAddress: 2, sendTransaction: 1, simulateTransaction: 2,
   getAsset: 10, getAssetBatch: 10, getAssetsByOwner: 10, getAssetsByGroup: 10, searchAssets: 10, getAssetProof: 10, getSignaturesForAsset: 10,
-  getPriorityFeeEstimate: 1, subscribe: 1, webhook: 1, enhanced: 100, getTransactionsForAddress: 100, getFundedBy: 100, sendTransactionWithRetry: 2, getTokenLargestAccounts: 100, pumpCurvePrice: 1, pumpWalletRanking: 1, pumpLaunchInfo: 1, pumpCandles: 2, pumpTrending: 5, pumpCurveScreener: 10, pumpFlow: 1, marketRegime: 1, pumpMarketRegime: 1,
+  getPriorityFeeEstimate: 1, subscribe: 1, webhook: 1, enhanced: 100, getTransactionsForAddress: 100, getFundedBy: 100, sendTransactionWithRetry: 2, getTokenLargestAccounts: 100, pumpCurvePrice: 1, pumpWalletRanking: 1, pumpLaunchInfo: 1, pumpCandles: 2, pumpTrending: 5, pumpCurveScreener: 10, pumpBigBuys: 1, pumpBigBuyers: 2, pumpBigBuyWallet: 1, pumpFlow: 1, marketRegime: 1, pumpMarketRegime: 1,
 };
 export const methodCost = (m: string) => COST[m] ?? 1;
 

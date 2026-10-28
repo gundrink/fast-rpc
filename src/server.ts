@@ -124,6 +124,7 @@ export class RpcServer {
     this.flowM = f;
     this.register("pumpTrending", (q: any) => f.trending(q ?? {}));
     this.register("pumpFlow", (mint: any) => f.flow(mint));
+    this.register("pumpCurveScreener", (q: any) => f.curveScreener(q ?? {}));
     this.register("fastFeedStatus", () => ({ upstream: (this.hub?.upstream as any)?.status?.() ?? null, pumpLastSwapAgoMs: f.lastSwapAt ? Date.now() - f.lastSwapAt : null }));
     return this;
   }
@@ -428,7 +429,7 @@ export class RpcServer {
     const send = (o: any) => { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(o)); };
 
     const one = async (r: any): Promise<JsonRpcReply | undefined> => {
-      const pm = typeof r?.method === "string" ? /^pump(Swap|Curve|Ranking|Candles|Regime|Trending|Flow)(Subscribe|Unsubscribe)$/.exec(r.method) : null;
+      const pm = typeof r?.method === "string" ? /^pump(Swap|Curve|Ranking|Candles|Regime|Trending|Flow|CurveScreener)(Subscribe|Unsubscribe)$/.exec(r.method) : null;
       if (pm && r.jsonrpc === "2.0") {
         const id = typeof r.id === "string" || typeof r.id === "number" ? r.id : null;
         const type = `pump${pm[1]}`;
@@ -448,6 +449,14 @@ export class RpcServer {
             const a = this.analytics; const q = { ...(p0 ?? {}) }; a.ranking(q); // validate
             const every = Math.max(10, Math.min(3600, Number(q.intervalSec ?? 60))) * 1000;
             const push = () => { try { out("pumpRankingNotification", a.ranking(q)); } catch {} };
+            const t = setInterval(push, every); t.unref?.(); setTimeout(push, 0);
+            subs.set(sid, { type, detach: () => clearInterval(t) });
+          } else if (pm[1] === "CurveScreener") {
+            if (!this.flowM) throw new RpcError(-32601, `${r.method}: pump market disabled (PUMP_MARKET=1)`);
+            const f = this.flowM; const q = { ...(p0 ?? {}) }; delete (q as any).intervalSec;
+            await f.curveScreener({ ...q, limit: 1, freshWallets: false, _validateOnly: true }).catch((e) => { if (e instanceof RpcError) throw e; });
+            const every = Math.max(15, Math.min(3600, Number(p0?.intervalSec ?? 30))) * 1000;
+            let busy = false; const push = async () => { if (busy) return; busy = true; try { out("pumpCurveScreenerNotification", await f.curveScreener(q)); } catch {} finally { busy = false; } };
             const t = setInterval(push, every); t.unref?.(); setTimeout(push, 0);
             subs.set(sid, { type, detach: () => clearInterval(t) });
           } else if (pm[1] === "Trending" || pm[1] === "Flow") {

@@ -73,3 +73,29 @@ test("upstream watchdog: reconnects when a logs sub goes silent; rotates URLs", 
   assert.ok(conns >= 2, "rotated to working url, then watchdog reconnected the silent logs sub"); assert.ok(up.watchdogDrops >= 1);
   stop(); up.close(); wss.close();
 });
+
+test("curve screener: gPA holders, age from oldest signature, bundled flag, eta, score, filters", async () => {
+  let now = 1_000_000_000; const eng = stub(); const curve = curvePda(M);
+  const { b58decode } = await import("../src/codec.js");
+  const acc = (owner: string, amt: number) => { const d = Buffer.alloc(40); b58decode(owner).copy(d, 0); d.writeBigUInt64LE(BigInt(amt), 32); return { pubkey: "x", account: { data: [d.toString("base64"), "base64"] } }; };
+  const H = ["8JUjWjAyXTMB4ZXcV7nk3p6Gg1fWAAoSck7xekuyADKL", "BsjFnU6yWqZ6T4k2Gsz7jFU7dN6Pe3KcsnPBDoQ6q4kp", DEV];
+  let calls: Record<string, number> = {};
+  const rpc = async (m: string, p: any[]) => { calls[m] = (calls[m] ?? 0) + 1;
+    if (m === "getAccountInfo") return { value: { owner: "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb" } };
+    if (m === "getProgramAccounts") return [acc(curve, 7e14), acc(H[0], 1e14), acc(H[1], 5e13), acc(DEV, 2e13), acc(H[0], 1e13), acc("11111111111111111111111111111111", 0)];
+    if (m === "getSignaturesForAddress" && p[0] === M) return [{ signature: "z", slot: 105, blockTime: 999_000 }, ...Array.from({ length: 6 }, (_, i) => ({ signature: "b" + i, slot: 100 + (i % 2), blockTime: 999_400 })), { signature: "c", slot: 100, blockTime: 999_400 }];
+    if (m === "getSignaturesForAddress") return [{ signature: "w", blockTime: 999_000 }];
+    return null; };
+  const f = new PumpFlow(eng, rpc, { now: () => now }).start(); const h = eng.hooks[0];
+  for (let i = 0; i < 40; i++) { h(sw({ mint: M, wallet: "B" + i, solAmount: 0.5, progress: 20 + i * 0.5 })); if (i % 10 === 9) now += 10_000; }
+  h(sw({ mint: M2, solAmount: 1, progress: 99 }));
+  const r: any = await f.curveScreener({ minBonding: 10, maxBonding: 90, limit: 5 });
+  assert.equal(r.tokens.length, 1); const t = r.tokens[0];
+  assert.equal(t.mint, M); assert.equal(t.enrichSource, "gpaCurve"); assert.equal(t.holderCount, 3); assert.equal(t.top10Pct, 18); assert.equal(t.curveOrPoolPct, 70); assert.equal(t.devHoldingPct, 2);
+  assert.equal(t.ageSec, 640); assert.equal(t.ageSource, "oldestSignature"); assert.equal(t.flags.earlyBuys3Slots, 6); assert.equal(t.flags.bundled, true); assert.equal(t.flags.freshWalletRatio, 1);
+  assert.ok(t.bondingVelocityPctPerMin > 0 && t.bondingEtaSec > 0); assert.ok(t.score >= 0 && t.score <= 100); assert.match(r.scoreFormula, /uniqueBuyers5m/);
+  assert.equal((await f.curveScreener({ maxTop10Pct: 10 })).tokens.length, 0);
+  assert.equal((await f.curveScreener({ minAgeSec: 5000 })).tokens.length, 0);
+  const n = calls.getProgramAccounts; await f.curveScreener({}); assert.equal(calls.getProgramAccounts, n, "enrichment cached");
+  await assert.rejects(f.curveScreener({ maxBonding: 200 }), /maxBonding/); await assert.rejects(f.curveScreener({ sort: "x" }), /sort one of/);
+});

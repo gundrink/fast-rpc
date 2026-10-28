@@ -13,11 +13,11 @@ const ITEM_REV = /"account":\{[^{}]*?"data":\["([A-Za-z0-9+/=]*)"[^{}]*\},"pubke
 
 /** Scan a streamed gPA JSON body; returns top-N {address, raw} by amount and the count scanned. */
 export async function scanTopAmounts(body: ReadableStream<Uint8Array>, top: number, maxBytes = Infinity) {
-  const best: { address: string; raw: bigint }[] = []; let n = 0, bytes = 0, buf = "", head = "";
+  const best: { address: string; raw: bigint }[] = []; let n = 0, nz = 0, bytes = 0, buf = "", head = "";
   const dec = new TextDecoder(); const reader = body.getReader();
   const push = (address: string, b64: string) => {
     const d = Buffer.from(b64, "base64"); if (d.length < 8) return; n++;
-    const raw = d.readBigUInt64LE(0);
+    const raw = d.readBigUInt64LE(0); if (raw > 0n) nz++;
     if (best.length < top) { best.push({ address, raw }); best.sort((a, b) => (b.raw > a.raw ? 1 : b.raw < a.raw ? -1 : 0)); return; }
     if (raw <= best[best.length - 1].raw) return;
     best[best.length - 1] = { address, raw }; best.sort((a, b) => (b.raw > a.raw ? 1 : b.raw < a.raw ? -1 : 0));
@@ -32,7 +32,7 @@ export async function scanTopAmounts(body: ReadableStream<Uint8Array>, top: numb
     buf = buf.slice(last); if (buf.length > 1 << 20) buf = buf.slice(-4096); // never grow unbounded
   }
   if (n === 0 && /"error"/.test(head + buf)) { const e = /"error":\s*\{[^}]*"code":\s*(-?\d+)[^}]*"message":\s*"([^"]*)"/.exec(head + buf); throw new RpcError(Number(e?.[1] ?? -32000), e?.[2] ?? "upstream error"); }
-  return { best, scanned: n, bytes };
+  return { best, scanned: n, nonZero: nz, bytes };
 }
 
 export function createTokenLargest(rpc: Rpc, o: LargestOptions) {
@@ -54,11 +54,11 @@ export function createTokenLargest(rpc: Rpc, o: LargestOptions) {
       try {
         const r = await fetcher(url, { method: "POST", headers: { "content-type": "application/json" }, body, signal: AbortSignal.timeout(o.timeoutMs ?? Number(process.env.TOKEN_LARGEST_TIMEOUT_MS ?? 120_000)) });
         if (!r.ok || !r.body) { errors.push(`${host(url)}: HTTP ${r.status}`); continue; }
-        const { best, scanned, bytes } = await scanTopAmounts(r.body, top, o.maxBytes ?? Number(process.env.TOKEN_LARGEST_MAX_BYTES ?? 2_000_000_000));
+        const { best, scanned, nonZero, bytes } = await scanTopAmounts(r.body, top, o.maxBytes ?? Number(process.env.TOKEN_LARGEST_MAX_BYTES ?? 2_000_000_000));
         const slot = (await rpc("getSlot", [])) as number;
         const div = 10 ** decimals;
         const value = best.map(({ address, raw }) => { const s = fmt(raw, decimals); return { address, amount: raw.toString(), decimals, uiAmount: Number(raw) / div, uiAmountString: s }; });
-        return { context: { slot }, value, _meta: { source: "getProgramAccounts", upstream: host(url), program, holdersScanned: scanned, bytes, ms: Date.now() - t0 } };
+        return { context: { slot }, value, _meta: { source: "getProgramAccounts", upstream: host(url), program, holdersScanned: scanned, holdersNonZero: nonZero, bytes, ms: Date.now() - t0 } };
       } catch (e: any) { errors.push(`${host(url)}: ${e?.message ?? e}`.slice(0, 200)); }
     }
     throw new RpcError(-32000, `getTokenLargestAccounts fallback failed on all upstreams: ${errors.join(" | ")}`);

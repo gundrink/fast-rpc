@@ -134,6 +134,7 @@ export function parsePumpLogs(logs: string[]) {
 export interface PumpSubParams { wallets?: string[]; mints?: string[]; allSwaps?: boolean; tags?: Record<string, string>; confirmations?: boolean; position?: boolean;
   /** drawdown thresholds in pct (e.g. [10,20,30]); one alert per threshold per high, re-armed on a new high */
   drawdownAlerts?: number[]; /** emit {type:"rebound"} when price recovers this pct off the low after a drawdown alert */ reboundPct?: number;
+  /** flow alerts in this subscription: {type:"largeSell"} when a wallet sells >= this % of its position (needs pump market) */ largeSellPct?: number; /** min SOL for largeSell (default 0.5) */ minSellSol?: number; /** {type:"devSell"} when the creator sells */ devSellAlerts?: boolean;
   /** attach nearest support/resistance (`levels`) from candles; needs pump market enabled */ levels?: boolean;
   /** default true: after a tagged wallet trades a mint, also stream all swaps on that mint */ trackTaggedMints?: boolean;
   /** swaps below this SOL size don't move high/drawdown (default 0.001) */ minSolForHigh?: number;
@@ -150,6 +151,8 @@ export function validatePumpParams(p: any): PumpSubParams {
   if (p.minSolForHigh !== undefined && !(typeof p.minSolForHigh === "number" && p.minSolForHigh >= 0)) throw INVALID_PARAMS("pumpSwapSubscribe: minSolForHigh must be >= 0");
   if (p.confluenceAlerts !== undefined && (!Array.isArray(p.confluenceAlerts) || p.confluenceAlerts.length > 20 || !p.confluenceAlerts.every((x: any) => Number.isInteger(x) && x >= 2))) throw INVALID_PARAMS("pumpSwapSubscribe: confluenceAlerts must be integers >= 2");
   if (p.confluenceWindowSec !== undefined && !(typeof p.confluenceWindowSec === "number" && p.confluenceWindowSec > 0 && p.confluenceWindowSec <= 86400)) throw INVALID_PARAMS("pumpSwapSubscribe: confluenceWindowSec in (0,86400]");
+  if (p.largeSellPct !== undefined && !(typeof p.largeSellPct === "number" && p.largeSellPct > 0 && p.largeSellPct <= 100)) throw INVALID_PARAMS("pumpSwapSubscribe: largeSellPct in (0,100]");
+  if (p.minSellSol !== undefined && !(typeof p.minSellSol === "number" && p.minSellSol >= 0)) throw INVALID_PARAMS("pumpSwapSubscribe: minSellSol >= 0");
   if (!p.wallets?.length && !p.mints?.length && p.allSwaps !== true) throw INVALID_PARAMS("pumpSwapSubscribe: give wallets, mints, or allSwaps:true");
   return p;
 }
